@@ -186,9 +186,11 @@ the cached rules, so later calls and ordinary edits reuse them.
 
 ## Symbolic payloads
 
-The `symbolica-typst-atom-payload` crate is the reusable boundary for extensions. It
-combines Symbolica's exact native Atom export with schema-keyed portable
-attachments and a generic render tree.
+The `symbolica-typst-plugin` Rust crate provides both the Typst plugin and a
+reusable library for other plugins, including tydenso. Its public `payload`,
+`math_display`, and `typst_ast` modules combine Symbolica's exact native Atom
+export with schema-keyed portable attachments, notation, parsing, and a render
+tree. The payload format is unchanged by this consolidation.
 
 `parse` preserves subscripts and corner attachments as decorated symbols.
 For example, `$a_0-a_1$` keeps two distinct variables, `$C_(i j)$` retains the
@@ -210,6 +212,36 @@ labels without depending on a runtime's symbol IDs.
 
 Several Typst packages are in development that make use of the symbolic payload, for example
 the tensor algebra package [spenso](https://github.com/alphal00p/gammaloop).
+
+### Reuse the Rust library
+
+Native consumers use the default `native` feature. A Wasm plugin such as tydenso
+disables defaults and enables only `wasm`:
+
+```toml
+[dependencies]
+symbolica-typst-plugin = { path = "../symbolica-typst-plugin", default-features = false, features = ["wasm"] }
+```
+
+Import helpers from `symbolica_typst_plugin::payload`,
+`symbolica_typst_plugin::math_display`, and
+`symbolica_typst_plugin::typst_ast`. Read and validate attachments before
+importing their Atom so your plugin can register any required symbol callbacks.
+Preserve attachments you do not interpret when exporting the result.
+
+The optional `plugin` feature adds this package's Typst entry points, integration
+engine, and runtime setup. Leave it disabled when embedding the library in
+another plugin. `wasm` selects Symbolica's Wasm backend independently of those
+entry points; use it without the default `native` backend.
+
+Normal Cargo builds produce an `rlib` for embedding. The plugin build script
+explicitly selects `cdylib` and `wasm,plugin` to produce the standalone Wasm
+module. See [rebuilding](REBUILDING.md) for the command and test instructions.
+
+The crate is not yet published on crates.io. Use a path dependency or a pinned
+Git revision, and select the compatible Symbolica revision in your workspace's
+Cargo patch table as described in [rebuilding](REBUILDING.md). Cargo does not
+inherit patches from dependencies.
 
 ## Use in the Typst web app
 

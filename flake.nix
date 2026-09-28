@@ -55,20 +55,26 @@
           };
           engineBuildScript = builtins.readFile ./scripts/build-engine.sh;
           dependencyBoundaryScript = ''
-            for package in symbolica-typst-plugin symbolica-typst-atom-payload; do
-              tree="$(cargo tree --edges normal --prefix none --format '{p}' --package "$package")"
+            for features in wasm wasm,plugin; do
+              tree="$(cargo tree --edges normal --prefix none --format '{p}' --package symbolica-typst-plugin --no-default-features --features "$features")"
               for dependency in spenso idenso; do
                 if [[ "$tree" == "$dependency v"* || "$tree" == *$'\n'"$dependency v"* ]]; then
-                  echo "$package must not depend on $dependency" >&2
+                  echo "symbolica-typst-plugin must not depend on $dependency" >&2
                   exit 1
                 fi
               done
             done
-            tree="$(cargo tree --edges normal --prefix none --format '{p}' --package symbolica-typst-atom-payload)"
-            if [[ "$tree" == *"symbolica-integrate v"* ]]; then
-              echo "The shared Atom payload crate must not depend on integration" >&2
-              exit 1
-            fi
+            tree="$(cargo tree --edges normal --prefix none --format '{p}' --package symbolica-typst-plugin --no-default-features --features wasm)"
+            for dependency in symbolica-integrate wasm-minimal-protocol; do
+              if [[ "$tree" == *"$dependency v"* ]]; then
+                echo "The reusable library must not depend on $dependency" >&2
+                exit 1
+              fi
+            done
+            # Check a real library build: `cargo check` alone misses accidental
+            # cdylib linking that would require the consuming plugin's imports.
+            cargo build --locked --lib --target wasm32-unknown-unknown \
+              --package symbolica-typst-plugin --no-default-features --features wasm
           '';
         in rec {
           default = build;

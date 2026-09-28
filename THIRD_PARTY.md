@@ -42,6 +42,12 @@ missing license texts fail generation. Provenance for license texts omitted
 from upstream crate archives is recorded in the development repository's
 `docs/license-sources/README.md`.
 
+The reusable payload, notation, and parsing modules are original MIT-licensed
+code within `symbolica-typst-plugin`, rather than a separate dependency.
+The notices describe the `wasm,plugin` build with default features disabled;
+native library builds use a different dependency set. Embedding the Rust
+library outside Typst does not extend the Symbolica Typst permission to that use.
+
 ## `symbolic-eval` example inspiration
 
 The following Symbolica examples are new implementations inspired by examples

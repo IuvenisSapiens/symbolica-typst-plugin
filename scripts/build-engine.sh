@@ -2,7 +2,8 @@
 set -euo pipefail
 target=wasm32-unknown-unknown
 unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS
-cargo build --locked --release --target "$target" --package symbolica-typst-plugin --no-default-features
+cargo rustc --locked --release --target "$target" --package symbolica-typst-plugin \
+  --lib --crate-type cdylib --no-default-features --features wasm,plugin
 
 engine_raw="symbolica/symbolica.wasm"
 # Symbolica's C API exports keep unrelated code alive in the linker.

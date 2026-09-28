@@ -6,8 +6,14 @@ prepared.
 
 ## Unreleased
 
-- Select Symbolica and the shared Atom payload through root Cargo patches so
-  build roots can override their sources consistently across dependencies.
+- Merge the shared Atom payload into `symbolica-typst-plugin`. Other Rust
+  plugins can reuse its public `payload`, `math_display`, and `typst_ast`
+  modules without enabling the Typst entry points or integration engine.
+  Native builds use the default `native` feature; Wasm library consumers use
+  `--no-default-features --features wasm`, and the complete Typst plugin adds
+  `plugin`. The payload protocol and attachment schemas are unchanged.
+- Select Symbolica through a root Cargo patch so build roots can override its
+  source consistently across dependencies.
 
 - Add `logo(size: 1em)` to draw the Symbolica logo inline with text.
 
@@ -17,7 +23,7 @@ prepared.
 
 - Update Symbolica to `main` at commit
   `06906976bca24fefc5203aee699d90d62ebe08cd`, shared by the plugin, integration
-  engine, and Atom payload crate. Keep builds locked to that revision and
+  engine, and payload modules. Keep builds locked to that revision and
   include Git source provenance in dependency notices.
   This revision uses Atom export format 6 and accepts only that format; stored
   Atom bytes from the registry 3.0.0 build (format 5) must be regenerated.

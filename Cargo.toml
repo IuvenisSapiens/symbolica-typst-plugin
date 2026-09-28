@@ -3,39 +3,37 @@ name = "symbolica-typst-plugin"
 version = "0.1.0"
 edition = "2024"
 publish = false
+description = "Symbolica for Typst, with reusable annotated expression interchange"
 license = "MIT"
 repository = "https://github.com/symbolica-dev/symbolica-typst-plugin"
+include = ["/src/**", "/tests/**", "/Cargo.toml", "/README.md", "/LICENSE"]
 
 [lib]
 name = "symbolica_typst_plugin"
-crate-type = ["cdylib"]
+# The same library also produces the plugin cdylib via scripts/build-engine.sh.
+# Dependencies use only rlib so the final plugin supplies its runtime imports.
+crate-type = ["rlib"]
 
 [features]
-default = []
+default = ["native"]
+native = ["symbolica/integer-gmp", "symbolica/float-mpfr"]
+wasm = ["symbolica/wasm"]
+# Only the final Symbolica plugin should enable its exports and runtime setup.
+plugin = ["dep:ahash", "dep:getrandom", "dep:symbolica-integrate", "dep:wasm-minimal-protocol"]
 
 [dependencies]
-ahash = { version = "0.8", default-features = false, features = ["std", "compile-time-rng"] }
+ahash = { version = "0.8", default-features = false, features = ["std", "compile-time-rng"], optional = true }
+blake3 = "1"
 ciborium = "0.2.2"
-getrandom = "0.3"
-symbolica = { workspace = true, features = ["wasm"] }
-symbolica-integrate = { version = "2.0.1", default-features = false, features = ["compressed-step-metadata"] }
-symbolica-typst-atom-payload = { version = "0.1.0", default-features = false, features = ["wasm"] }
-wasm-minimal-protocol = "0.1"
-
-[workspace]
-members = [
-  "crates/atom-payload",
-]
-resolver = "3"
-
-[workspace.dependencies]
+getrandom = { version = "0.3", optional = true }
 symbolica = { version = "3.0", default-features = false }
+symbolica-integrate = { version = "2.0.1", default-features = false, features = ["compressed-step-metadata"], optional = true }
+wasm-minimal-protocol = { version = "0.1", optional = true }
 
 # Select sources at the build root so overrides apply to every consumer.
 # Cargo.lock pins the exact commit for reproducible builds.
 [patch.crates-io]
 symbolica = { git = "https://github.com/symbolica-dev/symbolica.git", branch = "main" }
-symbolica-typst-atom-payload = { path = "crates/atom-payload" }
 
 [profile.release]
 lto = true

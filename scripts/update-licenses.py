@@ -30,9 +30,11 @@ def source_notice(package):
 
 
 def main():
-    metadata = json.loads(cargo("metadata", "--locked", "--format-version", "1"))
+    build_features = ("--no-default-features", "--features", "wasm,plugin")
+    metadata = json.loads(cargo("metadata", "--locked", "--format-version", "1",
+                                *build_features))
     tree = cargo("tree", "--locked", "--package", "symbolica-typst-plugin",
-                 "--target", "wasm32-unknown-unknown", "--no-default-features",
+                 "--target", "wasm32-unknown-unknown", *build_features,
                  "--edges", "normal,build", "--prefix", "none", "--format", "{p}")
     keys = set(re.findall(r"^(\S+) v(\S+)", tree, re.MULTILINE))
     packages = sorted((p for p in metadata["packages"]

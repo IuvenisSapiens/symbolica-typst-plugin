@@ -1,0 +1,2061 @@
+//! Symbolica Atom payloads exchanged by Symbolica-compatible plugins.
+//!
+//! The envelope validates the native Symbolica export's compatibility header,
+//! while keeping the rest of that export opaque. Consumers can inspect portable
+//! attachments before choosing to call [`Atom::import`] through
+//! [`ParsedPayload::import_atom`].
+
+use std::{
+    collections::{BTreeMap, btree_map::Entry},
+    fmt,
+    io::Cursor,
+    str,
+    sync::LazyLock,
+};
+
+pub mod math_display;
+pub mod typst_ast;
+
+use ciborium::value::Value;
+use symbolica::{
+    atom::{Atom, AtomCore, AtomView, Symbol, SymbolAttribute},
+    printer::PrintOptions,
+};
+
+/// Magic prefix for the versioned envelope.
+pub const PAYLOAD_MAGIC: &[u8; 8] = b"SYMATOM\0";
+/// Current binary-envelope version.
+pub const PAYLOAD_VERSION: u16 = 2;
+
+/// Protocol discriminator for the generic CBOR Atom render tree.
+pub const RENDER_TREE_PROTOCOL: &str = "symbolica";
+/// Current schema version of the generic CBOR Atom render tree.
+pub const RENDER_TREE_VERSION: u16 = 1;
+/// Kind discriminator for the generic CBOR Atom render tree.
+pub const RENDER_TREE_KIND: &str = "atom-render-tree";
+
+pub const MAX_ATOM_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_PAYLOAD_BYTES: usize = 10 * 1024 * 1024;
+pub const MAX_ATTACHMENTS: usize = 256;
+pub const MAX_ATTACHMENT_KEY_BYTES: usize = 1024;
+pub const MAX_ATTACHMENT_SCHEMA_BYTES: usize = 128;
+pub const MAX_ATTACHMENT_DATA_BYTES: usize = 256 * 1024;
+pub const MAX_TOTAL_ATTACHMENT_BYTES: usize = 1024 * 1024;
+
+const SYMBOLICA_MAGIC: u32 = 0x3787_1367;
+// Follow the linked Symbolica backend: its binary format can change between
+// releases, and accepting another backend's version would admit incompatible
+// atoms before consumers have inspected their attachments.
+static SYMBOLICA_EXPORT_FORMAT_VERSION: LazyLock<u16> = LazyLock::new(|| {
+    let export = export_raw_atom(&Atom::Zero).expect("exporting zero to memory cannot fail");
+    u16::from_le_bytes(export[4..6].try_into().expect("Symbolica export version"))
+});
+const SYMBOLICA_HEADER_BYTES: usize = size_of::<u32>() + size_of::<u16>();
+// Permit redundant records to be merged without letting their wire count grow
+// without bound. MAX_ATTACHMENTS applies to unique keys.
+const MAX_ENCODED_ATTACHMENT_RECORDS: usize = 1024;
+const FIXED_HEADER_BYTES: usize = PAYLOAD_MAGIC.len() + 2 + 2 + 2 + 4;
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AttachmentKey {
+    schema: String,
+    version: u32,
+    identity: Vec<u8>,
+}
+
+impl AttachmentKey {
+    /// Construct a stable attachment key.
+    ///
+    /// `schema` identifies the attachment format, `version` identifies that
+    /// schema's version, and `identity` distinguishes independent values using
+    /// the same schema. Identity bytes are opaque and compared byte-for-byte.
+    pub fn new(
+        schema: impl Into<String>,
+        version: u32,
+        identity: impl Into<Vec<u8>>,
+    ) -> Result<Self, PayloadError> {
+        let key = Self {
+            schema: schema.into(),
+            version,
+            identity: identity.into(),
+        };
+        validate_attachment_key(&key.schema, key.version, &key.identity)?;
+        Ok(key)
+    }
+
+    pub fn schema(&self) -> &str {
+        &self.schema
+    }
+
+    pub fn version(&self) -> u32 {
+        self.version
+    }
+
+    pub fn identity(&self) -> &[u8] {
+        &self.identity
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Attachment {
+    key: AttachmentKey,
+    data: Vec<u8>,
+}
+
+impl Attachment {
+    pub fn new(key: AttachmentKey, data: impl Into<Vec<u8>>) -> Result<Self, PayloadError> {
+        let data = data.into();
+        validate_attachment_data(&data)?;
+        Ok(Self { key, data })
+    }
+
+    pub fn key(&self) -> &AttachmentKey {
+        &self.key
+    }
+
+    pub fn data(&self) -> &[u8] {
+        &self.data
+    }
+}
+
+/// An owned, deterministically ordered collection of portable attachments.
+///
+/// Insertion and merge are idempotent for identical `(key, data)` pairs. A
+/// repeated key with different data is always an error. [`Self::merge`] checks
+/// all conflicts before mutating `self`, so failed merges are transactional.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AttachmentSet {
+    entries: BTreeMap<AttachmentKey, Vec<u8>>,
+}
+
+impl AttachmentSet {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn from_attachments(
+        attachments: impl IntoIterator<Item = Attachment>,
+    ) -> Result<Self, PayloadError> {
+        let mut set = Self::new();
+        for attachment in attachments {
+            set.insert(attachment)?;
+        }
+        Ok(set)
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Insert an attachment, returning `true` only when a new key was added.
+    pub fn insert(&mut self, attachment: Attachment) -> Result<bool, PayloadError> {
+        validate_attachment_key(
+            &attachment.key.schema,
+            attachment.key.version,
+            &attachment.key.identity,
+        )?;
+        validate_attachment_data(&attachment.data)?;
+        let current_entry_count = self.entries.len();
+        let current_attachment_bytes = self.total_attachment_bytes();
+        match self.entries.entry(attachment.key) {
+            Entry::Occupied(entry) if entry.get() == &attachment.data => Ok(false),
+            Entry::Occupied(entry) => Err(PayloadError::ConflictingAttachment(entry.key().clone())),
+            Entry::Vacant(entry) => {
+                if current_entry_count >= MAX_ATTACHMENTS {
+                    return Err(PayloadError::LimitExceeded);
+                }
+                let added_bytes = entry
+                    .key()
+                    .schema
+                    .len()
+                    .checked_add(entry.key().identity.len())
+                    .and_then(|length| length.checked_add(attachment.data.len()))
+                    .ok_or(PayloadError::LimitExceeded)?;
+                if current_attachment_bytes
+                    .checked_add(added_bytes)
+                    .is_none_or(|length| length > MAX_TOTAL_ATTACHMENT_BYTES)
+                {
+                    return Err(PayloadError::LimitExceeded);
+                }
+                entry.insert(attachment.data);
+                Ok(true)
+            }
+        }
+    }
+
+    /// Merge another set without changing either operand on conflict.
+    pub fn merge(&mut self, other: &Self) -> Result<(), PayloadError> {
+        for (key, data) in &other.entries {
+            if let Some(existing) = self.entries.get(key)
+                && existing != data
+            {
+                return Err(PayloadError::ConflictingAttachment(key.clone()));
+            }
+        }
+
+        let new_entries = other
+            .entries
+            .iter()
+            .filter(|(key, _)| !self.entries.contains_key(*key))
+            .count();
+        if self
+            .entries
+            .len()
+            .checked_add(new_entries)
+            .is_none_or(|length| length > MAX_ATTACHMENTS)
+        {
+            return Err(PayloadError::LimitExceeded);
+        }
+        let merged_bytes = self
+            .total_attachment_bytes()
+            .checked_add(
+                other
+                    .entries
+                    .iter()
+                    .filter(|(key, _)| !self.entries.contains_key(*key))
+                    .try_fold(0usize, |total, (key, data)| {
+                        total
+                            .checked_add(key.schema.len())
+                            .and_then(|total| total.checked_add(key.identity.len()))
+                            .and_then(|total| total.checked_add(data.len()))
+                            .ok_or(PayloadError::LimitExceeded)
+                    })?,
+            )
+            .ok_or(PayloadError::LimitExceeded)?;
+        if merged_bytes > MAX_TOTAL_ATTACHMENT_BYTES {
+            return Err(PayloadError::LimitExceeded);
+        }
+
+        for (key, data) in &other.entries {
+            self.entries
+                .entry(key.clone())
+                .or_insert_with(|| data.clone());
+        }
+        Ok(())
+    }
+
+    pub fn get(&self, key: &AttachmentKey) -> Option<&[u8]> {
+        self.entries.get(key).map(Vec::as_slice)
+    }
+
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = AttachmentRef<'_>> {
+        self.entries.iter().map(|(key, data)| AttachmentRef {
+            schema: &key.schema,
+            version: key.version,
+            identity: &key.identity,
+            data,
+        })
+    }
+
+    /// Wrap already-exported native Atom bytes with this set in tests.
+    #[cfg(test)]
+    fn encode_exported_atom(&self, atom_bytes: &[u8]) -> Result<Vec<u8>, PayloadError> {
+        encode_exported_atom_from_set(atom_bytes, self)
+    }
+
+    fn total_attachment_bytes(&self) -> usize {
+        self.entries.iter().fold(0usize, |total, (key, data)| {
+            total + key.schema.len() + key.identity.len() + data.len()
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AttachmentRef<'a> {
+    schema: &'a str,
+    version: u32,
+    identity: &'a [u8],
+    data: &'a [u8],
+}
+
+impl<'a> AttachmentRef<'a> {
+    pub fn schema(&self) -> &'a str {
+        self.schema
+    }
+
+    pub fn version(&self) -> u32 {
+        self.version
+    }
+
+    pub fn identity(&self) -> &'a [u8] {
+        self.identity
+    }
+
+    pub fn data(&self) -> &'a [u8] {
+        self.data
+    }
+
+    pub fn to_owned_attachment(&self) -> Attachment {
+        Attachment {
+            key: AttachmentKey {
+                schema: self.schema.to_owned(),
+                version: self.version,
+                identity: self.identity.to_vec(),
+            },
+            data: self.data.to_vec(),
+        }
+    }
+}
+
+/// A validated payload whose compatible native Atom bytes remain unimported.
+#[derive(Debug)]
+pub struct ParsedPayload<'a> {
+    atom_bytes: &'a [u8],
+    attachments: Vec<AttachmentRef<'a>>,
+}
+
+impl<'a> ParsedPayload<'a> {
+    /// Native Symbolica Atom-and-state bytes, still unimported.
+    pub fn atom_bytes(&self) -> &'a [u8] {
+        self.atom_bytes
+    }
+
+    /// Attachments in deterministic key order, with identical duplicates merged.
+    pub fn attachments(&self) -> &[AttachmentRef<'a>] {
+        &self.attachments
+    }
+
+    pub fn attachment(&self, key: &AttachmentKey) -> Option<&'a [u8]> {
+        self.attachments
+            .iter()
+            .find(|attachment| {
+                attachment.schema == key.schema
+                    && attachment.version == key.version
+                    && attachment.identity == key.identity
+            })
+            .map(|attachment| attachment.data)
+    }
+
+    /// Clone the inspected attachment refs into a reusable owned set.
+    ///
+    /// Parsing has already validated uniqueness and every size invariant, so
+    /// this conversion cannot fail.
+    pub fn attachment_set(&self) -> AttachmentSet {
+        AttachmentSet {
+            entries: self
+                .attachments
+                .iter()
+                .map(|attachment| {
+                    (
+                        AttachmentKey {
+                            schema: attachment.schema.to_owned(),
+                            version: attachment.version,
+                            identity: attachment.identity.to_vec(),
+                        },
+                        attachment.data.to_vec(),
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    /// Import the Atom only after envelope inspection has completed.
+    ///
+    /// # Trust boundary
+    ///
+    /// The native Atom export remains opaque to this crate. The current
+    /// upstream importer trusts lengths embedded inside that export and merges
+    /// Symbolica's global state before the complete Atom and trailing bytes are
+    /// validated. Consequently, malformed native bytes may allocate excessive
+    /// memory or leave partial state changes even when this method returns an
+    /// error. Only import native bytes produced by a trusted compatible plugin.
+    pub fn import_atom(&self) -> Result<Atom, PayloadError> {
+        import_raw_atom(self.atom_bytes)
+    }
+}
+
+#[derive(Debug)]
+pub enum PayloadError {
+    LimitExceeded,
+    TrailingBytes,
+    UnsupportedEnvelopeVersion(u16),
+    InvalidEnvelope(&'static str),
+    InvalidAttachment(&'static str),
+    InvalidMathDisplay(String),
+    ConflictingAttachment(AttachmentKey),
+    Cbor(String),
+    Export(std::io::Error),
+    Import(std::io::Error),
+}
+
+impl fmt::Display for PayloadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LimitExceeded => {
+                formatter.write_str("Atom payload exceeds a size or count limit")
+            }
+            Self::TrailingBytes => formatter.write_str("Atom payload has trailing bytes"),
+            Self::UnsupportedEnvelopeVersion(version) => {
+                write!(formatter, "unsupported Atom envelope version {version}")
+            }
+            Self::InvalidEnvelope(reason) => write!(formatter, "invalid Atom envelope: {reason}"),
+            Self::InvalidAttachment(reason) => write!(formatter, "invalid attachment: {reason}"),
+            Self::InvalidMathDisplay(reason) => write!(formatter, "invalid math display: {reason}"),
+            Self::ConflictingAttachment(key) => write!(
+                formatter,
+                "conflicting data for attachment {} version {} (identity is {} bytes)",
+                key.schema,
+                key.version,
+                key.identity.len()
+            ),
+            Self::Cbor(error) => write!(formatter, "could not encode Atom render tree: {error}"),
+            Self::Export(error) => write!(formatter, "could not export Atom: {error}"),
+            Self::Import(error) => write!(formatter, "could not import Atom: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for PayloadError {}
+
+fn validate_attachment_key(
+    schema: &str,
+    version: u32,
+    identity: &[u8],
+) -> Result<(), PayloadError> {
+    if schema.is_empty() {
+        return Err(PayloadError::InvalidAttachment("schema cannot be empty"));
+    }
+    if schema.len() > MAX_ATTACHMENT_SCHEMA_BYTES {
+        return Err(PayloadError::LimitExceeded);
+    }
+    if !schema.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':' | b'/')
+    }) {
+        return Err(PayloadError::InvalidAttachment(
+            "schema must use ASCII letters, digits, '-', '_', '.', ':', or '/'",
+        ));
+    }
+    if version == 0 {
+        return Err(PayloadError::InvalidAttachment(
+            "schema version must be nonzero",
+        ));
+    }
+    if identity.is_empty() {
+        return Err(PayloadError::InvalidAttachment("identity cannot be empty"));
+    }
+    if schema
+        .len()
+        .checked_add(identity.len())
+        .is_none_or(|length| length > MAX_ATTACHMENT_KEY_BYTES)
+    {
+        return Err(PayloadError::LimitExceeded);
+    }
+    Ok(())
+}
+
+fn validate_attachment_data(data: &[u8]) -> Result<(), PayloadError> {
+    if data.len() > MAX_ATTACHMENT_DATA_BYTES {
+        return Err(PayloadError::LimitExceeded);
+    }
+    Ok(())
+}
+
+fn preflight_raw_atom(input: &[u8]) -> Result<(), PayloadError> {
+    let header = input
+        .get(..SYMBOLICA_HEADER_BYTES)
+        .ok_or(PayloadError::InvalidEnvelope(
+            "Atom export is shorter than its Symbolica header",
+        ))?;
+    let magic = u32::from_le_bytes(header[..4].try_into().expect("four-byte slice"));
+    if magic != SYMBOLICA_MAGIC {
+        return Err(PayloadError::InvalidEnvelope(
+            "Atom export has the wrong Symbolica magic",
+        ));
+    }
+    let version = u16::from_le_bytes(header[4..].try_into().expect("two-byte slice"));
+    if version != *SYMBOLICA_EXPORT_FORMAT_VERSION {
+        return Err(PayloadError::InvalidEnvelope(
+            "Atom export uses an unsupported Symbolica format version",
+        ));
+    }
+    Ok(())
+}
+
+fn export_raw_atom(atom: &Atom) -> Result<Vec<u8>, PayloadError> {
+    let mut output = Vec::new();
+    atom.as_view()
+        .export(&mut output)
+        .map_err(PayloadError::Export)?;
+    if output.len() > MAX_ATOM_BYTES {
+        return Err(PayloadError::LimitExceeded);
+    }
+    Ok(output)
+}
+
+fn import_raw_atom(input: &[u8]) -> Result<Atom, PayloadError> {
+    if input.len() > MAX_ATOM_BYTES {
+        return Err(PayloadError::LimitExceeded);
+    }
+    // The envelope bounds the outer byte slice, but upstream Atom::import
+    // currently allocates from embedded lengths and mutates global State while
+    // reading. See ParsedPayload::import_atom for the public trust contract.
+    let mut cursor = Cursor::new(input);
+    let atom = Atom::import(&mut cursor, None).map_err(PayloadError::Import)?;
+    if cursor.position() != input.len() as u64 {
+        return Err(PayloadError::TrailingBytes);
+    }
+    Ok(atom)
+}
+
+fn push_u16(output: &mut Vec<u8>, value: usize) -> Result<(), PayloadError> {
+    output.extend_from_slice(
+        &u16::try_from(value)
+            .map_err(|_| PayloadError::LimitExceeded)?
+            .to_be_bytes(),
+    );
+    Ok(())
+}
+
+fn push_u32(output: &mut Vec<u8>, value: usize) -> Result<(), PayloadError> {
+    output.extend_from_slice(
+        &u32::try_from(value)
+            .map_err(|_| PayloadError::LimitExceeded)?
+            .to_be_bytes(),
+    );
+    Ok(())
+}
+
+fn encode_exported_atom_from_set(
+    atom_bytes: &[u8],
+    attachments: &AttachmentSet,
+) -> Result<Vec<u8>, PayloadError> {
+    if atom_bytes.len() > MAX_ATOM_BYTES {
+        return Err(PayloadError::LimitExceeded);
+    }
+    preflight_raw_atom(atom_bytes)?;
+
+    let attachment_bytes = attachments.total_attachment_bytes();
+    if attachment_bytes > MAX_TOTAL_ATTACHMENT_BYTES {
+        return Err(PayloadError::LimitExceeded);
+    }
+
+    let entry_headers = attachments
+        .len()
+        .checked_mul(2 + 4 + 4 + 4)
+        .ok_or(PayloadError::LimitExceeded)?;
+    let total_size = FIXED_HEADER_BYTES
+        .checked_add(atom_bytes.len())
+        .and_then(|total| total.checked_add(entry_headers))
+        .and_then(|total| total.checked_add(attachment_bytes))
+        .ok_or(PayloadError::LimitExceeded)?;
+    if total_size > MAX_PAYLOAD_BYTES {
+        return Err(PayloadError::LimitExceeded);
+    }
+
+    let mut output = Vec::with_capacity(total_size);
+    output.extend_from_slice(PAYLOAD_MAGIC);
+    output.extend_from_slice(&PAYLOAD_VERSION.to_be_bytes());
+    output.extend_from_slice(&0u16.to_be_bytes()); // reserved flags
+    push_u16(&mut output, attachments.len())?;
+    push_u32(&mut output, atom_bytes.len())?;
+    output.extend_from_slice(atom_bytes);
+
+    for (key, data) in &attachments.entries {
+        push_u16(&mut output, key.schema.len())?;
+        output.extend_from_slice(&key.version.to_be_bytes());
+        push_u32(&mut output, key.identity.len())?;
+        push_u32(&mut output, data.len())?;
+        output.extend_from_slice(key.schema.as_bytes());
+        output.extend_from_slice(&key.identity);
+        output.extend_from_slice(data);
+    }
+    debug_assert_eq!(output.len(), total_size);
+    Ok(output)
+}
+
+/// Wrap already-exported native Symbolica Atom bytes in the current envelope.
+///
+/// This function does not import or otherwise interpret `atom_bytes`.
+#[cfg(test)]
+fn encode_exported_atom(
+    atom_bytes: &[u8],
+    attachments: impl IntoIterator<Item = Attachment>,
+) -> Result<Vec<u8>, PayloadError> {
+    let attachments = AttachmentSet::from_attachments(attachments)?;
+    encode_exported_atom_from_set(atom_bytes, &attachments)
+}
+
+/// Export an Atom and attach portable, schema-keyed data.
+pub fn encode_atom_with_attachments(
+    atom: &Atom,
+    attachments: impl IntoIterator<Item = Attachment>,
+) -> Result<Vec<u8>, PayloadError> {
+    encode_atom_from_set(atom, &AttachmentSet::from_attachments(attachments)?)
+}
+
+/// Export an Atom and attach a reusable owned set.
+pub fn encode_atom_from_set(
+    atom: &Atom,
+    attachments: &AttachmentSet,
+) -> Result<Vec<u8>, PayloadError> {
+    let attachments = with_math_displays(atom, attachments)?;
+    encode_exported_atom_from_set(&export_raw_atom(atom)?, &attachments)
+}
+
+/// Export one Atom, including portable declarations for its decorated symbols.
+pub fn encode_atom(atom: &Atom) -> Result<Vec<u8>, PayloadError> {
+    encode_atom_with_attachments(atom, std::iter::empty())
+}
+
+fn with_math_displays(
+    atom: &Atom,
+    attachments: &AttachmentSet,
+) -> Result<AttachmentSet, PayloadError> {
+    let mut merged = attachments.clone();
+    let mut pending: Vec<_> = atom.get_all_symbols(true).into_iter().collect();
+    let mut seen = std::collections::HashSet::new();
+    let mut displays = Vec::new();
+    while let Some(symbol) = pending.pop() {
+        if !seen.insert(symbol) {
+            continue;
+        }
+        if let Some(display) = math_display::MathDisplay::from_symbol(symbol)
+            .map_err(PayloadError::InvalidMathDisplay)?
+        {
+            // Merge every supplied declaration before generating any new one.
+            // An outer symbol can carry the original declaration of an inner
+            // symbol, independent of global symbol traversal order.
+            merged.merge(
+                &display
+                    .embedded_attachments()
+                    .map_err(PayloadError::InvalidMathDisplay)?,
+            )?;
+            let mut embedded = Default::default();
+            symbol.get_data().get_symbols(&mut embedded);
+            pending.extend(embedded);
+            displays.push((symbol, display));
+        }
+    }
+    for (symbol, display) in displays {
+        let generated = display
+            .attachment(symbol)
+            .map_err(PayloadError::InvalidMathDisplay)?;
+        if let Some(original) = merged.get(&generated.key) {
+            if original != generated.data {
+                // Native Atom exports use session-local symbol IDs. A display
+                // reconstructed after import can therefore serialize different
+                // bytes despite retaining exactly the same semantic Atom. Only
+                // validate this known regenerated schema semantically; all
+                // input attachment merging remains strictly byte-based.
+                let mut cursor = Cursor::new(original);
+                let value: Value = ciborium::from_reader(&mut cursor)
+                    .map_err(|error| PayloadError::InvalidMathDisplay(error.to_string()))?;
+                if cursor.position() != original.len() as u64 {
+                    return Err(PayloadError::InvalidMathDisplay(
+                        "trailing bytes in math-display declaration".to_owned(),
+                    ));
+                }
+                let declared = math_display::MathDisplay::from_value(&value)
+                    .map_err(PayloadError::InvalidMathDisplay)?;
+                if declared != display {
+                    return Err(PayloadError::ConflictingAttachment(generated.key));
+                }
+            }
+            // Preserve the declaration bytes supplied by the originating
+            // runtime, including any nested native Atom export.
+        } else {
+            merged.insert(generated)?;
+        }
+    }
+    Ok(merged)
+}
+
+static DISPLAY_PRINT_WRAPPER: LazyLock<Symbol> = LazyLock::new(|| {
+    symbolica::symbol!(
+        "symbolica_typst::display_print",
+        print = |view, options, state| {
+            if !options.mode.is_typst() {
+                return None;
+            }
+            let AtomView::Fun(wrapper) = view else {
+                return None;
+            };
+            let inner = wrapper.iter().next()?;
+            let symbol = inner.get_symbol()?;
+            let display = math_display::MathDisplay::from_symbol(symbol).ok()??;
+            let source = display.to_symbol_typst_source();
+            match inner {
+                AtomView::Var(_) => Some(source),
+                AtomView::Fun(function) => {
+                    let mut output = String::new();
+                    function
+                        .format(Some(&format!("op({source})")), &mut output, options, *state)
+                        .ok()?;
+                    Some(output)
+                }
+                _ => None,
+            }
+        }
+    )
+});
+
+/// Prepare a temporary display-only expression for Symbolica's Typst printer.
+///
+/// Display symbols themselves have no custom callbacks, so native export/import
+/// remains independent of the runtime that created them. Only this temporary
+/// wrapper uses a callback; it must never be exported as an algebraic result.
+pub fn prepare_typst_display(atom: &Atom) -> Result<Atom, String> {
+    Ok(prepare_typst_display_if_needed(atom)?.unwrap_or_else(|| atom.clone()))
+}
+
+fn prepare_typst_display_if_needed(atom: &Atom) -> Result<Option<Atom>, String> {
+    let symbols = atom
+        .get_all_symbols(true)
+        .into_iter()
+        .filter_map(
+            |symbol| match math_display::MathDisplay::from_symbol(symbol) {
+                Ok(Some(_)) => Some(Ok(symbol)),
+                Ok(None) => None,
+                Err(error) => Some(Err(error)),
+            },
+        )
+        .collect::<Result<std::collections::HashSet<_>, String>>()?;
+    if symbols.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(atom.replace_map_bottom_up(|view, _, out| {
+        if view
+            .get_symbol()
+            .is_some_and(|symbol| symbols.contains(&symbol))
+        {
+            **out = DISPLAY_PRINT_WRAPPER.call(view);
+        }
+    })))
+}
+
+fn unwrap_display_print(view: AtomView<'_>) -> Option<AtomView<'_>> {
+    if let AtomView::Fun(function) = view
+        && function.get_symbol() == *DISPLAY_PRINT_WRAPPER
+    {
+        return function.iter().next();
+    }
+    None
+}
+
+/// Remove temporary printer callbacks from every nested semantic payload.
+fn semantic_render_atom(view: AtomView<'_>, display_wrapped: bool) -> Atom {
+    if !display_wrapped {
+        return view.to_owned();
+    }
+    view.replace_map_bottom_up(|view, _, out| {
+        if let Some(inner) = unwrap_display_print(view) {
+            **out = inner.to_owned();
+        }
+    })
+}
+
+fn render_tree_map(entries: impl IntoIterator<Item = (&'static str, Value)>) -> Value {
+    Value::Map(
+        entries
+            .into_iter()
+            .map(|(key, value)| (Value::Text(key.to_owned()), value))
+            .collect(),
+    )
+}
+
+fn symbol_attribute_name(attribute: SymbolAttribute) -> &'static str {
+    match attribute {
+        SymbolAttribute::Symmetric => "symmetric",
+        SymbolAttribute::Antisymmetric => "antisymmetric",
+        SymbolAttribute::Cyclesymmetric => "cyclesymmetric",
+        SymbolAttribute::Linear => "linear",
+        SymbolAttribute::Flat => "flat",
+        SymbolAttribute::Scalar => "scalar",
+        SymbolAttribute::Real => "real",
+        SymbolAttribute::Integer => "integer",
+        SymbolAttribute::Positive => "positive",
+    }
+}
+
+/// Render a symbol using Symbolica's built-in Typst symbol rules.
+///
+/// This deliberately does not call the symbol's custom Rust print callback.
+/// The implementation mirrors `Symbol::format` with
+/// [`PrintOptions::typst`] (which hides namespaces); the complete namespaced
+/// identity remains available separately in the symbol descriptor.
+fn builtin_typst_symbol_source(symbol: Symbol) -> String {
+    if symbol == Symbol::E {
+        "e".to_owned()
+    } else if symbol == Symbol::PI {
+        "pi".to_owned()
+    } else if symbol == Symbol::COS {
+        "cos".to_owned()
+    } else if symbol == Symbol::SIN {
+        "sin".to_owned()
+    } else if symbol == Symbol::EXP {
+        "exp".to_owned()
+    } else if symbol == Symbol::LOG {
+        "log".to_owned()
+    } else {
+        let name = symbol.get_stripped_name();
+        if name.chars().count() == 1 {
+            name.to_owned()
+        } else {
+            format!("\"{name}\"")
+        }
+    }
+}
+
+fn typst_symbol_source(symbol: Symbol) -> Result<String, PayloadError> {
+    Ok(
+        match math_display::MathDisplay::from_symbol(symbol)
+            .map_err(PayloadError::InvalidMathDisplay)?
+        {
+            Some(display) => display.to_symbol_typst_source(),
+            None => builtin_typst_symbol_source(symbol),
+        },
+    )
+}
+
+fn symbol_render_tree_value(symbol: Symbol) -> Value {
+    render_tree_map([
+        ("name", Value::Text(symbol.get_name().to_owned())),
+        ("namespace", Value::Text(symbol.get_namespace().to_owned())),
+        (
+            "short-name",
+            Value::Text(symbol.get_stripped_name().to_owned()),
+        ),
+        (
+            "tags",
+            Value::Array(
+                symbol
+                    .get_tags()
+                    .iter()
+                    .map(|tag| Value::Text(tag.clone()))
+                    .collect(),
+            ),
+        ),
+        (
+            "attributes",
+            Value::Array(
+                symbol
+                    .get_attributes()
+                    .into_iter()
+                    .map(|attribute| Value::Text(symbol_attribute_name(attribute).to_owned()))
+                    .collect(),
+            ),
+        ),
+    ])
+}
+
+fn atom_render_node_value(
+    view: AtomView<'_>,
+    attachments: &AttachmentSet,
+    display_wrapped: bool,
+) -> Result<Value, PayloadError> {
+    if display_wrapped && let Some(inner) = unwrap_display_print(view) {
+        return atom_render_node_value(inner, attachments, true);
+    }
+    match view {
+        AtomView::Num(_) => {
+            // Numeric nodes intentionally carry no exact Atom payload. They
+            // stay editable as ordinary textual Typst mathematics.
+            let source = view.printer(PrintOptions::typst()).to_string();
+            Ok(render_tree_map([
+                ("kind", Value::Text("number".to_owned())),
+                ("text", Value::Text(source.clone())),
+                ("source", Value::Text(source)),
+            ]))
+        }
+        AtomView::Var(variable) => {
+            let atom = semantic_render_atom(view, display_wrapped);
+            let symbol = variable.get_symbol();
+            Ok(render_tree_map([
+                ("kind", Value::Text("variable".to_owned())),
+                ("symbol", symbol_render_tree_value(symbol)),
+                ("source", Value::Text(typst_symbol_source(symbol)?)),
+                (
+                    "atom",
+                    Value::Bytes(encode_atom_from_set(&atom, attachments)?),
+                ),
+            ]))
+        }
+        AtomView::Fun(function) => {
+            let atom = semantic_render_atom(view, display_wrapped);
+            let symbol = function.get_symbol();
+            let head = Atom::var(symbol);
+            let arguments = function
+                .iter()
+                .map(|argument| atom_render_node_value(argument, attachments, display_wrapped))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(render_tree_map([
+                ("kind", Value::Text("function".to_owned())),
+                ("symbol", symbol_render_tree_value(symbol)),
+                ("source", Value::Text(typst_symbol_source(symbol)?)),
+                (
+                    "head-atom",
+                    Value::Bytes(encode_atom_from_set(&head, attachments)?),
+                ),
+                (
+                    "atom",
+                    Value::Bytes(encode_atom_from_set(&atom, attachments)?),
+                ),
+                ("arguments", Value::Array(arguments)),
+            ]))
+        }
+        AtomView::Pow(power) => {
+            let (base, exponent) = power.get_base_exp();
+            let atom = semantic_render_atom(view, display_wrapped);
+            let mut fields = vec![
+                ("kind", Value::Text("power".to_owned())),
+                (
+                    "base",
+                    atom_render_node_value(base, attachments, display_wrapped)?,
+                ),
+                (
+                    "exponent",
+                    atom_render_node_value(exponent, attachments, display_wrapped)?,
+                ),
+                (
+                    "atom",
+                    Value::Bytes(encode_atom_from_set(&atom, attachments)?),
+                ),
+            ];
+            if symbolica::domains::rational::Rational::try_from(exponent)
+                .is_ok_and(|value| value.numerator() < 0)
+            {
+                let reciprocal = atom.pow(-1);
+                fields.push((
+                    "reciprocal-atom",
+                    Value::Bytes(encode_atom_from_set(&reciprocal, attachments)?),
+                ));
+            }
+            Ok(render_tree_map(fields))
+        }
+        AtomView::Mul(product) => Ok(render_tree_map([
+            ("kind", Value::Text("product".to_owned())),
+            (
+                "factors",
+                Value::Array(
+                    product
+                        .iter()
+                        .map(|factor| atom_render_node_value(factor, attachments, display_wrapped))
+                        .collect::<Result<Vec<_>, _>>()?,
+                ),
+            ),
+        ])),
+        AtomView::Add(sum) => Ok(render_tree_map([
+            ("kind", Value::Text("sum".to_owned())),
+            (
+                "terms",
+                Value::Array(
+                    sum.iter()
+                        .map(|term| atom_render_node_value(term, attachments, display_wrapped))
+                        .collect::<Result<Vec<_>, _>>()?,
+                ),
+            ),
+        ])),
+    }
+}
+
+/// Build the versioned, generic CBOR render tree for an Atom.
+///
+/// Algebraic structure and Symbolica symbol metadata are exposed without any
+/// package-specific interpretation. Variable nodes carry an exact portable
+/// Atom payload; function nodes carry exact payloads for both the complete call
+/// and its variable head. Power nodes also carry exact payloads so a renderer
+/// can preserve semantics when merging native Typst attachment positions.
+/// Negative rational powers include their reciprocal for denominator layout.
+/// Every exact payload receives the complete supplied
+/// attachment set, including attachment schemas unknown to this crate.
+pub fn atom_render_tree_value(
+    atom: &Atom,
+    attachments: &AttachmentSet,
+) -> Result<Value, PayloadError> {
+    let attachments = with_math_displays(atom, attachments)?;
+    let prepared = if attachments
+        .iter()
+        .any(|attachment| attachment.schema() == math_display::MATH_DISPLAY_SCHEMA)
+    {
+        prepare_typst_display_if_needed(atom).map_err(PayloadError::InvalidMathDisplay)?
+    } else {
+        None
+    };
+    let visual_atom = prepared.as_ref().unwrap_or(atom);
+    let attachment_values = attachments
+        .iter()
+        .map(|attachment| {
+            render_tree_map([
+                ("schema", Value::Text(attachment.schema().to_owned())),
+                (
+                    "version",
+                    Value::Integer(i64::from(attachment.version()).into()),
+                ),
+                ("identity", Value::Bytes(attachment.identity().to_vec())),
+                ("data", Value::Bytes(attachment.data().to_vec())),
+            ])
+        })
+        .collect();
+
+    Ok(render_tree_map([
+        ("protocol", Value::Text(RENDER_TREE_PROTOCOL.to_owned())),
+        (
+            "version",
+            Value::Integer(i64::from(RENDER_TREE_VERSION).into()),
+        ),
+        ("kind", Value::Text(RENDER_TREE_KIND.to_owned())),
+        (
+            "root",
+            atom_render_node_value(visual_atom.as_view(), &attachments, prepared.is_some())?,
+        ),
+        ("attachments", Value::Array(attachment_values)),
+    ]))
+}
+
+/// Encode the generic Atom render tree as CBOR bytes.
+pub fn encode_atom_render_tree(
+    atom: &Atom,
+    attachments: &AttachmentSet,
+) -> Result<Vec<u8>, PayloadError> {
+    let value = atom_render_tree_value(atom, attachments)?;
+    let mut output = Vec::new();
+    ciborium::into_writer(&value, &mut output)
+        .map_err(|error| PayloadError::Cbor(error.to_string()))?;
+    Ok(output)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct BorrowedAttachmentKey<'a> {
+    schema: &'a str,
+    version: u32,
+    identity: &'a [u8],
+}
+
+struct Reader<'a> {
+    input: &'a [u8],
+    position: usize,
+}
+
+impl<'a> Reader<'a> {
+    fn new(input: &'a [u8]) -> Self {
+        Self { input, position: 0 }
+    }
+
+    fn take(&mut self, length: usize) -> Result<&'a [u8], PayloadError> {
+        let end = self
+            .position
+            .checked_add(length)
+            .ok_or(PayloadError::LimitExceeded)?;
+        let value = self
+            .input
+            .get(self.position..end)
+            .ok_or(PayloadError::InvalidEnvelope("unexpected end of input"))?;
+        self.position = end;
+        Ok(value)
+    }
+
+    fn u16(&mut self) -> Result<u16, PayloadError> {
+        Ok(u16::from_be_bytes(
+            self.take(2)?.try_into().expect("two-byte slice"),
+        ))
+    }
+
+    fn u32(&mut self) -> Result<u32, PayloadError> {
+        Ok(u32::from_be_bytes(
+            self.take(4)?.try_into().expect("four-byte slice"),
+        ))
+    }
+
+    fn is_finished(&self) -> bool {
+        self.position == self.input.len()
+    }
+}
+
+fn parse_envelope(input: &[u8]) -> Result<ParsedPayload<'_>, PayloadError> {
+    let mut reader = Reader::new(input);
+    if reader.take(PAYLOAD_MAGIC.len())? != PAYLOAD_MAGIC {
+        return Err(PayloadError::InvalidEnvelope("wrong magic"));
+    }
+    let version = reader.u16()?;
+    if version != PAYLOAD_VERSION {
+        return Err(PayloadError::UnsupportedEnvelopeVersion(version));
+    }
+    if reader.u16()? != 0 {
+        return Err(PayloadError::InvalidEnvelope("reserved flags must be zero"));
+    }
+    let entry_count = usize::from(reader.u16()?);
+    let atom_length = usize::try_from(reader.u32()?).map_err(|_| PayloadError::LimitExceeded)?;
+    if entry_count > MAX_ENCODED_ATTACHMENT_RECORDS || atom_length > MAX_ATOM_BYTES {
+        return Err(PayloadError::LimitExceeded);
+    }
+    let atom_bytes = reader.take(atom_length)?;
+    preflight_raw_atom(atom_bytes)?;
+
+    let mut total_attachment_bytes = 0usize;
+    let mut merged = BTreeMap::<BorrowedAttachmentKey<'_>, &'_ [u8]>::new();
+    for _ in 0..entry_count {
+        let schema_length = usize::from(reader.u16()?);
+        let version = reader.u32()?;
+        let identity_length =
+            usize::try_from(reader.u32()?).map_err(|_| PayloadError::LimitExceeded)?;
+        let data_length =
+            usize::try_from(reader.u32()?).map_err(|_| PayloadError::LimitExceeded)?;
+        if schema_length > MAX_ATTACHMENT_SCHEMA_BYTES
+            || schema_length
+                .checked_add(identity_length)
+                .is_none_or(|length| length > MAX_ATTACHMENT_KEY_BYTES)
+            || data_length > MAX_ATTACHMENT_DATA_BYTES
+        {
+            return Err(PayloadError::LimitExceeded);
+        }
+
+        let schema = str::from_utf8(reader.take(schema_length)?)
+            .map_err(|_| PayloadError::InvalidAttachment("schema is not UTF-8"))?;
+        let identity = reader.take(identity_length)?;
+        let data = reader.take(data_length)?;
+        validate_attachment_key(schema, version, identity)?;
+        validate_attachment_data(data)?;
+        total_attachment_bytes = total_attachment_bytes
+            .checked_add(schema_length)
+            .and_then(|total| total.checked_add(identity_length))
+            .and_then(|total| total.checked_add(data_length))
+            .ok_or(PayloadError::LimitExceeded)?;
+        if total_attachment_bytes > MAX_TOTAL_ATTACHMENT_BYTES {
+            return Err(PayloadError::LimitExceeded);
+        }
+
+        let key = BorrowedAttachmentKey {
+            schema,
+            version,
+            identity,
+        };
+        let unique_entry_count = merged.len();
+        match merged.entry(key) {
+            Entry::Vacant(entry) => {
+                if unique_entry_count >= MAX_ATTACHMENTS {
+                    return Err(PayloadError::LimitExceeded);
+                }
+                entry.insert(data);
+            }
+            Entry::Occupied(entry) if entry.get() == &data => {}
+            Entry::Occupied(entry) => {
+                return Err(PayloadError::ConflictingAttachment(AttachmentKey {
+                    schema: entry.key().schema.to_owned(),
+                    version: entry.key().version,
+                    identity: entry.key().identity.to_vec(),
+                }));
+            }
+        }
+    }
+    if !reader.is_finished() {
+        return Err(PayloadError::TrailingBytes);
+    }
+
+    Ok(ParsedPayload {
+        atom_bytes,
+        attachments: merged
+            .into_iter()
+            .map(|(key, data)| AttachmentRef {
+                schema: key.schema,
+                version: key.version,
+                identity: key.identity,
+                data,
+            })
+            .collect(),
+    })
+}
+
+/// Validate a current envelope and expose its metadata without importing the Atom.
+pub fn parse_payload(input: &[u8]) -> Result<ParsedPayload<'_>, PayloadError> {
+    if input.len() > MAX_PAYLOAD_BYTES {
+        return Err(PayloadError::LimitExceeded);
+    }
+    parse_envelope(input)
+}
+
+/// Import an Atom from a current envelope.
+pub fn decode_atom(input: &[u8]) -> Result<Atom, PayloadError> {
+    parse_payload(input)?.import_atom()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use symbolica::prelude::{Coefficient, Complex, Float};
+    use symbolica::{function, parse, symbol};
+
+    static OPAQUE_ATOM_EXPORT: LazyLock<Vec<u8>> = LazyLock::new(|| {
+        // Symbolica magic, little endian.
+        let mut bytes = SYMBOLICA_MAGIC.to_le_bytes().to_vec();
+        // Symbolica export format, little endian, matching the linked backend.
+        bytes.extend_from_slice(&SYMBOLICA_EXPORT_FORMAT_VERSION.to_le_bytes());
+        bytes.extend_from_slice(b"opaque");
+        bytes
+    });
+
+    fn key(schema: &str, version: u32, identity: &[u8]) -> AttachmentKey {
+        AttachmentKey::new(schema, version, identity.to_vec()).unwrap()
+    }
+
+    fn attachment(schema: &str, version: u32, identity: &[u8], data: &[u8]) -> Attachment {
+        Attachment::new(key(schema, version, identity), data.to_vec()).unwrap()
+    }
+
+    fn duplicate_last_entry(mut payload: Vec<u8>, conflicting: bool) -> Vec<u8> {
+        let atom_length =
+            usize::try_from(u32::from_be_bytes(payload[14..18].try_into().unwrap())).unwrap();
+        let entry_start = FIXED_HEADER_BYTES + atom_length;
+        let mut duplicate = payload[entry_start..].to_vec();
+        if conflicting {
+            *duplicate.last_mut().unwrap() ^= 1;
+        }
+        payload[12..14].copy_from_slice(&2u16.to_be_bytes());
+        payload.extend_from_slice(&duplicate);
+        payload
+    }
+
+    fn repeat_last_entry(mut payload: Vec<u8>, count: u16) -> Vec<u8> {
+        assert!(count >= 1);
+        let atom_length =
+            usize::try_from(u32::from_be_bytes(payload[14..18].try_into().unwrap())).unwrap();
+        let entry_start = FIXED_HEADER_BYTES + atom_length;
+        let entry = payload[entry_start..].to_vec();
+        payload[12..14].copy_from_slice(&count.to_be_bytes());
+        for _ in 1..count {
+            payload.extend_from_slice(&entry);
+        }
+        payload
+    }
+
+    fn value_field<'a>(map: &'a [(Value, Value)], key: &str) -> Option<&'a Value> {
+        map.iter().find_map(|(candidate, value)| {
+            matches!(candidate, Value::Text(candidate) if candidate == key).then_some(value)
+        })
+    }
+
+    fn find_node<'a>(value: &'a Value, kind: &str) -> Option<&'a [(Value, Value)]> {
+        match value {
+            Value::Map(map) => {
+                if value_field(map, "kind") == Some(&Value::Text(kind.to_owned())) {
+                    return Some(map);
+                }
+                map.iter().find_map(|(_, child)| find_node(child, kind))
+            }
+            Value::Array(values) => values.iter().find_map(|child| find_node(child, kind)),
+            _ => None,
+        }
+    }
+
+    fn collect_node_kinds(value: &Value, kinds: &mut std::collections::BTreeSet<String>) {
+        match value {
+            Value::Map(map) => {
+                if let Some(Value::Text(kind)) = value_field(map, "kind") {
+                    kinds.insert(kind.clone());
+                }
+                for (_, child) in map {
+                    collect_node_kinds(child, kinds);
+                }
+            }
+            Value::Array(values) => {
+                for child in values {
+                    collect_node_kinds(child, kinds);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn envelope_supports_two_stage_inspection_without_import() {
+        let attachment_key = key("org.symbolica.test", 1, b"namespace::f");
+        let payload = encode_exported_atom(
+            &OPAQUE_ATOM_EXPORT,
+            [Attachment::new(attachment_key.clone(), b"metadata".to_vec()).unwrap()],
+        )
+        .unwrap();
+
+        let parsed = parse_payload(&payload).unwrap();
+        assert_eq!(parsed.attachments().len(), 1);
+        assert_eq!(
+            parsed.attachment(&attachment_key),
+            Some(b"metadata".as_slice())
+        );
+        assert_eq!(parsed.atom_bytes(), OPAQUE_ATOM_EXPORT.as_slice());
+    }
+
+    #[test]
+    fn encoding_is_deterministic_and_merges_identical_entries() {
+        let a = attachment("org.symbolica.a", 1, b"a", b"first");
+        let b = attachment("org.symbolica.b", 2, b"b", b"second");
+        let forward = encode_exported_atom(&OPAQUE_ATOM_EXPORT, [a.clone(), b.clone()]).unwrap();
+        let reversed_with_duplicate =
+            encode_exported_atom(&OPAQUE_ATOM_EXPORT, [b, a.clone(), a]).unwrap();
+
+        assert_eq!(forward, reversed_with_duplicate);
+        let parsed = parse_payload(&forward).unwrap();
+        assert_eq!(parsed.attachments().len(), 2);
+        assert_eq!(parsed.attachments()[0].schema(), "org.symbolica.a");
+        assert_eq!(parsed.attachments()[1].schema(), "org.symbolica.b");
+    }
+
+    #[test]
+    fn attachment_sets_merge_associatively_and_reencode_raw_exports() {
+        let a = AttachmentSet::from_attachments([attachment("org.symbolica.a", 1, b"a", b"first")])
+            .unwrap();
+        let b = AttachmentSet::from_attachments([
+            attachment("org.symbolica.a", 1, b"a", b"first"),
+            attachment("org.symbolica.b", 1, b"b", b"second"),
+        ])
+        .unwrap();
+        let c = AttachmentSet::from_attachments([attachment("org.symbolica.c", 2, b"c", b"third")])
+            .unwrap();
+
+        let mut left = a.clone();
+        left.merge(&b).unwrap();
+        left.merge(&c).unwrap();
+        let mut right_tail = b.clone();
+        right_tail.merge(&c).unwrap();
+        let mut right = a;
+        right.merge(&right_tail).unwrap();
+        assert_eq!(left, right);
+        assert_eq!(left.len(), 3);
+        assert_eq!(
+            left.get(&key("org.symbolica.b", 1, b"b")),
+            Some(b"second".as_slice())
+        );
+        assert_eq!(left.iter().count(), 3);
+
+        let encoded = left.encode_exported_atom(&OPAQUE_ATOM_EXPORT).unwrap();
+        let parsed = parse_payload(&encoded).unwrap();
+        assert_eq!(parsed.atom_bytes(), OPAQUE_ATOM_EXPORT.as_slice());
+        assert_eq!(parsed.attachment_set(), left);
+    }
+
+    #[test]
+    fn attachment_limit_counts_unique_keys_after_deduplication() {
+        let repeated = attachment("org.symbolica.same", 1, b"same", b"same-data");
+        let set = AttachmentSet::from_attachments(std::iter::repeat_n(
+            repeated.clone(),
+            MAX_ATTACHMENTS + 1,
+        ))
+        .unwrap();
+        assert_eq!(set.len(), 1);
+
+        let encoded = encode_exported_atom(&OPAQUE_ATOM_EXPORT, [repeated]).unwrap();
+        let repeated_on_wire = repeat_last_entry(encoded, (MAX_ATTACHMENTS + 1) as u16);
+        assert_eq!(
+            parse_payload(&repeated_on_wire)
+                .unwrap()
+                .attachments()
+                .len(),
+            1
+        );
+
+        let unique = (0..=MAX_ATTACHMENTS)
+            .map(|index| attachment("org.symbolica.unique", 1, &index.to_be_bytes(), b"data"))
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            AttachmentSet::from_attachments(unique),
+            Err(PayloadError::LimitExceeded)
+        ));
+    }
+
+    #[test]
+    fn attachment_set_conflicts_are_transactional() {
+        let mut target = AttachmentSet::from_attachments([
+            attachment("org.symbolica.a", 1, b"a", b"original"),
+            attachment("org.symbolica.b", 1, b"b", b"stable"),
+        ])
+        .unwrap();
+        let before = target.clone();
+        let conflicting = AttachmentSet::from_attachments([
+            attachment("org.symbolica.c", 1, b"c", b"new"),
+            attachment("org.symbolica.a", 1, b"a", b"different"),
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            target.merge(&conflicting),
+            Err(PayloadError::ConflictingAttachment(_))
+        ));
+        assert_eq!(target, before);
+    }
+
+    #[test]
+    fn attachment_set_limit_failures_are_transactional() {
+        let mut count_limited = AttachmentSet::from_attachments(
+            (0..MAX_ATTACHMENTS)
+                .map(|index| attachment("org.symbolica.count", 1, &index.to_be_bytes(), b"data")),
+        )
+        .unwrap();
+        let count_before = count_limited.clone();
+        let count_overflow = AttachmentSet::from_attachments([attachment(
+            "org.symbolica.count",
+            1,
+            b"overflow",
+            b"data",
+        )])
+        .unwrap();
+        assert!(matches!(
+            count_limited.merge(&count_overflow),
+            Err(PayloadError::LimitExceeded)
+        ));
+        assert_eq!(count_limited, count_before);
+
+        let large_data = vec![0; MAX_ATTACHMENT_DATA_BYTES];
+        let mut byte_limited =
+            AttachmentSet::from_attachments((0_u32..3).map(|index| {
+                attachment("org.symbolica.bytes", 1, &index.to_be_bytes(), &large_data)
+            }))
+            .unwrap();
+        let byte_before = byte_limited.clone();
+        let byte_overflow = AttachmentSet::from_attachments([attachment(
+            "org.symbolica.bytes",
+            1,
+            &3_u32.to_be_bytes(),
+            &large_data,
+        )])
+        .unwrap();
+        assert!(matches!(
+            byte_limited.merge(&byte_overflow),
+            Err(PayloadError::LimitExceeded)
+        ));
+        assert_eq!(byte_limited, byte_before);
+    }
+
+    #[test]
+    fn conflicting_entries_are_rejected_during_encode_and_parse() {
+        let first = attachment("org.symbolica.test", 1, b"same", b"one");
+        let second = attachment("org.symbolica.test", 1, b"same", b"two");
+        assert!(matches!(
+            encode_exported_atom(&OPAQUE_ATOM_EXPORT, [first.clone(), second]),
+            Err(PayloadError::ConflictingAttachment(_))
+        ));
+
+        let encoded = encode_exported_atom(&OPAQUE_ATOM_EXPORT, [first]).unwrap();
+        assert_eq!(
+            parse_payload(&duplicate_last_entry(encoded.clone(), false))
+                .unwrap()
+                .attachments()
+                .len(),
+            1
+        );
+        assert!(matches!(
+            parse_payload(&duplicate_last_entry(encoded, true)),
+            Err(PayloadError::ConflictingAttachment(_))
+        ));
+    }
+
+    #[test]
+    fn incompatible_symbolica_headers_are_rejected_during_parse() {
+        let payload = encode_exported_atom(
+            &OPAQUE_ATOM_EXPORT,
+            [attachment("org.symbolica.test", 1, b"id", b"data")],
+        )
+        .unwrap();
+
+        let mut wrong_magic = payload.clone();
+        wrong_magic[FIXED_HEADER_BYTES] ^= 1;
+        let entry_start = FIXED_HEADER_BYTES + OPAQUE_ATOM_EXPORT.len();
+        wrong_magic[entry_start..entry_start + 2].copy_from_slice(
+            &u16::try_from(MAX_ATTACHMENT_SCHEMA_BYTES + 1)
+                .unwrap()
+                .to_be_bytes(),
+        );
+        assert!(matches!(
+            parse_payload(&wrong_magic),
+            Err(PayloadError::InvalidEnvelope(
+                "Atom export has the wrong Symbolica magic"
+            ))
+        ));
+
+        let mut wrong_format = payload;
+        wrong_format[FIXED_HEADER_BYTES + 4..FIXED_HEADER_BYTES + 6]
+            .copy_from_slice(&(*SYMBOLICA_EXPORT_FORMAT_VERSION ^ 1).to_le_bytes());
+        assert!(matches!(
+            parse_payload(&wrong_format),
+            Err(PayloadError::InvalidEnvelope(
+                "Atom export uses an unsupported Symbolica format version"
+            ))
+        ));
+    }
+
+    #[test]
+    fn truncated_envelopes_are_always_rejected() {
+        let payload = encode_exported_atom(
+            &OPAQUE_ATOM_EXPORT,
+            [attachment("org.symbolica.test", 1, b"id", b"data")],
+        )
+        .unwrap();
+
+        for length in 0..payload.len() {
+            assert!(
+                parse_payload(&payload[..length]).is_err(),
+                "truncation at byte {length} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_envelopes_are_rejected() {
+        let payload = encode_exported_atom(&OPAQUE_ATOM_EXPORT, []).unwrap();
+
+        let mut unsupported_version = payload.clone();
+        unsupported_version[8..10].copy_from_slice(&(PAYLOAD_VERSION + 1).to_be_bytes());
+        assert!(matches!(
+            parse_payload(&unsupported_version),
+            Err(PayloadError::UnsupportedEnvelopeVersion(_))
+        ));
+
+        let mut reserved_flags = payload.clone();
+        reserved_flags[10..12].copy_from_slice(&1_u16.to_be_bytes());
+        assert!(matches!(
+            parse_payload(&reserved_flags),
+            Err(PayloadError::InvalidEnvelope(_))
+        ));
+
+        let mut empty_atom = payload;
+        empty_atom[14..18].copy_from_slice(&0_u32.to_be_bytes());
+        assert!(matches!(
+            parse_payload(&empty_atom),
+            Err(PayloadError::InvalidEnvelope(_))
+        ));
+
+        assert!(matches!(
+            parse_payload(b"not an Atom payload"),
+            Err(PayloadError::InvalidEnvelope(_))
+        ));
+        let attachments = AttachmentSet::new();
+        assert!(matches!(
+            encode_exported_atom_from_set(&OPAQUE_ATOM_EXPORT[..5], &attachments),
+            Err(PayloadError::InvalidEnvelope(_))
+        ));
+        let mut wrong_magic = OPAQUE_ATOM_EXPORT.to_vec();
+        wrong_magic[0] ^= 1;
+        assert!(matches!(
+            encode_exported_atom_from_set(&wrong_magic, &attachments),
+            Err(PayloadError::InvalidEnvelope(_))
+        ));
+    }
+
+    #[test]
+    fn limits_and_trailing_bytes_are_enforced() {
+        assert!(matches!(
+            AttachmentKey::new("org.symbolica.test", 1, vec![0; MAX_ATTACHMENT_KEY_BYTES]),
+            Err(PayloadError::LimitExceeded)
+        ));
+        assert!(matches!(
+            Attachment::new(
+                key("org.symbolica.test", 1, b"id"),
+                vec![0; MAX_ATTACHMENT_DATA_BYTES + 1]
+            ),
+            Err(PayloadError::LimitExceeded)
+        ));
+
+        let mut payload = encode_exported_atom(&OPAQUE_ATOM_EXPORT, []).unwrap();
+        payload.push(0);
+        assert!(matches!(
+            parse_payload(&payload),
+            Err(PayloadError::TrailingBytes)
+        ));
+
+        let mut too_many_records = encode_exported_atom(&OPAQUE_ATOM_EXPORT, []).unwrap();
+        too_many_records[12..14].copy_from_slice(
+            &u16::try_from(MAX_ENCODED_ATTACHMENT_RECORDS + 1)
+                .unwrap()
+                .to_be_bytes(),
+        );
+        assert!(matches!(
+            parse_payload(&too_many_records),
+            Err(PayloadError::LimitExceeded)
+        ));
+    }
+
+    #[test]
+    fn native_export_format_matches_the_linked_backend() {
+        let raw = export_raw_atom(&Atom::Zero).unwrap();
+        let payload = encode_atom(&Atom::Zero).unwrap();
+        let parsed = parse_payload(&payload).unwrap();
+        assert_eq!(parsed.atom_bytes(), raw);
+        assert_eq!(parsed.import_atom().unwrap(), Atom::Zero);
+
+        // A neighboring format is still incompatible, even when this backend
+        // happens to have adopted the next version since the payload release.
+        let mut foreign = payload;
+        let version = u16::from_le_bytes(raw[4..6].try_into().unwrap());
+        foreign[FIXED_HEADER_BYTES + 4..FIXED_HEADER_BYTES + 6]
+            .copy_from_slice(&(version ^ 1).to_le_bytes());
+        assert!(matches!(
+            parse_payload(&foreign),
+            Err(PayloadError::InvalidEnvelope(
+                "Atom export uses an unsupported Symbolica format version"
+            ))
+        ));
+    }
+
+    fn render_order_display_variable() -> Atom {
+        use crate::payload::math_display::MathDisplay;
+        let mut slots = std::array::from_fn(|_| None);
+        slots[1] = Some(Box::new(MathDisplay::Symbol("i".to_owned())));
+        Atom::var(
+            MathDisplay::Attach {
+                base: Box::new(MathDisplay::Symbol("a".to_owned())),
+                slots,
+            }
+            .register("render_order_display_test")
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn display_render_tree_uses_the_typst_printers_factor_and_term_order() {
+        let literal = render_order_display_variable();
+        let z = Atom::var(Symbol::parse("z", "render_order_display_test").unwrap());
+        for (atom, kind, children) in [
+            (literal.clone() * z.clone(), "product", "factors"),
+            (literal.clone() + z, "sum", "terms"),
+        ] {
+            let prepared = prepare_typst_display(&atom).unwrap();
+            let source = prepared.printer(PrintOptions::typst()).to_string();
+            let tree = atom_render_tree_value(&atom, &AttachmentSet::new()).unwrap();
+            let root = find_node(&tree, kind).unwrap();
+            let Some(Value::Array(nodes)) = value_field(root, children) else {
+                panic!("missing children")
+            };
+            let positions = nodes
+                .iter()
+                .map(|node| {
+                    let Value::Map(node) = node else {
+                        panic!("expected variable node")
+                    };
+                    assert_eq!(
+                        value_field(node, "kind"),
+                        Some(&Value::Text("variable".to_owned()))
+                    );
+                    let Some(Value::Text(leaf_source)) = value_field(node, "source") else {
+                        panic!("missing variable source")
+                    };
+                    source
+                        .find(leaf_source)
+                        .unwrap_or_else(|| panic!("{leaf_source} missing from {source}"))
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                positions.windows(2).all(|pair| pair[0] < pair[1]),
+                "tree disagrees with source order: {source}"
+            );
+        }
+    }
+
+    fn assert_no_print_wrappers_in_tree_payloads(value: &Value) {
+        match value {
+            Value::Map(fields) => {
+                for (key, value) in fields {
+                    if matches!(key, Value::Text(key) if matches!(key.as_str(), "atom" | "head-atom" | "reciprocal-atom"))
+                    {
+                        let Value::Bytes(bytes) = value else {
+                            panic!("exact payload is not bytes")
+                        };
+                        let atom = decode_atom(bytes).unwrap();
+                        assert!(!atom.get_all_symbols(true).contains(&*DISPLAY_PRINT_WRAPPER));
+                    }
+                    assert_no_print_wrappers_in_tree_payloads(value);
+                }
+            }
+            Value::Array(values) => {
+                for value in values {
+                    assert_no_print_wrappers_in_tree_payloads(value);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn display_render_payloads_strip_wrappers_and_preserve_power_reciprocals() {
+        let literal = render_order_display_variable();
+        for exponent in [
+            Atom::num(2),
+            Atom::num(-2),
+            Atom::num((1, 2)),
+            Atom::num((-2, 3)),
+        ] {
+            let power = literal.clone().pow(exponent.clone());
+            let tree = atom_render_tree_value(&power, &AttachmentSet::new()).unwrap();
+            let node = find_node(&tree, "power").unwrap();
+            let Some(Value::Bytes(bytes)) = value_field(node, "atom") else {
+                panic!("power lacks exact payload")
+            };
+            assert_eq!(decode_atom(bytes).unwrap(), power);
+            if exponent
+                .printer(PrintOptions::typst())
+                .to_string()
+                .starts_with('-')
+            {
+                let Some(Value::Bytes(bytes)) = value_field(node, "reciprocal-atom") else {
+                    panic!("negative power lacks reciprocal payload")
+                };
+                assert_eq!(decode_atom(bytes).unwrap(), literal.clone().pow(-exponent));
+            } else {
+                assert!(value_field(node, "reciprocal-atom").is_none());
+            }
+            assert_no_print_wrappers_in_tree_payloads(&tree);
+        }
+        let f = Symbol::parse("f", "render_order_display_test").unwrap();
+        let call = f.call(literal.clone().pow(2) + literal.pow(-2));
+        let tree = atom_render_tree_value(&call, &AttachmentSet::new()).unwrap();
+        let node = find_node(&tree, "function").unwrap();
+        let Some(Value::Bytes(bytes)) = value_field(node, "atom") else {
+            panic!("call lacks exact payload")
+        };
+        assert_eq!(decode_atom(bytes).unwrap(), call);
+        assert_no_print_wrappers_in_tree_payloads(&tree);
+    }
+
+    #[test]
+    fn display_regeneration_preserves_equivalent_original_declaration_bytes() {
+        use crate::payload::math_display::MathDisplay;
+        let embedded = Atom::var(Symbol::parse("x", "display_wire_preservation").unwrap());
+        let display = MathDisplay::Atom {
+            atom: embedded,
+            attachments: AttachmentSet::new(),
+        };
+        let symbol = display.register("display_wire_preservation").unwrap();
+        let generated = display.attachment(symbol).unwrap();
+        // The same nested-Atom declaration in a different legal CBOR encoding.
+        // Real cross-runtime exports also differ in native symbol ID bytes.
+        assert_eq!(generated.data[0], 0x82);
+        let mut original = vec![0x9f];
+        original.extend_from_slice(&generated.data[1..]);
+        original.push(0xff);
+        let supplied = AttachmentSet::from_attachments([Attachment::new(
+            generated.key.clone(),
+            original.clone(),
+        )
+        .unwrap()])
+        .unwrap();
+        let payload = encode_atom_from_set(&Atom::var(symbol), &supplied).unwrap();
+        let parsed = parse_payload(&payload).unwrap();
+        assert_eq!(parsed.attachment(&generated.key), Some(original.as_slice()));
+        assert_eq!(parsed.import_atom().unwrap(), Atom::var(symbol));
+
+        // An outer symbol supplies an inner declaration even when the inner
+        // symbol also appears independently in the expression.
+        let outer = MathDisplay::Atom {
+            atom: Atom::var(symbol),
+            attachments: supplied,
+        }
+        .register("display_wire_preservation_outer")
+        .unwrap();
+        let payload = encode_atom(&(Atom::var(outer) + Atom::var(symbol))).unwrap();
+        assert_eq!(
+            parse_payload(&payload).unwrap().attachment(&generated.key),
+            Some(original.as_slice())
+        );
+    }
+
+    #[test]
+    fn display_regeneration_rejects_semantic_conflicts_without_weakening_merge() {
+        use crate::payload::math_display::MathDisplay;
+        let original = MathDisplay::Symbol("x".to_owned());
+        let symbol = original.register("display_wire_conflicts").unwrap();
+        let declaration = original.attachment(symbol).unwrap();
+        let mut different = Vec::new();
+        ciborium::into_writer(
+            &MathDisplay::Symbol("y".to_owned()).to_value(),
+            &mut different,
+        )
+        .unwrap();
+        let supplied =
+            AttachmentSet::from_attachments([
+                Attachment::new(declaration.key.clone(), different).unwrap()
+            ])
+            .unwrap();
+        assert!(matches!(
+            encode_atom_from_set(&Atom::var(symbol), &supplied),
+            Err(PayloadError::ConflictingAttachment(key)) if key == declaration.key,
+        ));
+
+        let mut equivalent = vec![0x9f];
+        equivalent.extend_from_slice(&declaration.data[1..]);
+        equivalent.push(0xff);
+        let mut strict = AttachmentSet::from_attachments([declaration.clone()]).unwrap();
+        let before = strict.clone();
+        let incoming =
+            AttachmentSet::from_attachments(
+                [Attachment::new(declaration.key, equivalent).unwrap()],
+            )
+            .unwrap();
+        assert!(matches!(
+            strict.merge(&incoming),
+            Err(PayloadError::ConflictingAttachment(_))
+        ));
+        assert_eq!(strict, before);
+    }
+
+    #[test]
+    fn decorated_symbols_render_after_native_import() {
+        use crate::payload::math_display::{MATH_DISPLAY_SCHEMA, MathDisplay};
+        let display = MathDisplay::Attach {
+            base: Box::new(MathDisplay::Symbol("h".to_owned())),
+            slots: std::array::from_fn(|i| (i == 3).then(|| Box::new(MathDisplay::Primes(2)))),
+        };
+        let head = display.register("display_render_test").unwrap();
+        let variable = Atom::var(head);
+        let call = head.call(variable.clone() + Atom::num(1));
+        let payload = encode_atom(&call).unwrap();
+        let parsed = parse_payload(&payload).unwrap();
+        assert!(
+            parsed
+                .attachments()
+                .iter()
+                .any(|a| a.schema() == MATH_DISPLAY_SCHEMA)
+        );
+        let imported = parsed.import_atom().unwrap();
+        assert_eq!(imported, call);
+        assert!(head.get_print_function().is_none());
+        let nested = MathDisplay::Atom {
+            atom: variable,
+            attachments: AttachmentSet::new(),
+        }
+        .register("display_render_nested_test")
+        .unwrap();
+        let nested_payload = encode_atom(&Atom::var(nested)).unwrap();
+        assert_eq!(
+            parse_payload(&nested_payload).unwrap().attachments().len(),
+            2
+        );
+        let prepared = prepare_typst_display(&imported).unwrap();
+        let source = prepared.printer(PrintOptions::typst()).to_string();
+        assert!(source.contains("op(attach(h,tr:primes(#2)))"), "{source}");
+        assert_eq!(source.matches("attach(h,tr:primes(#2))").count(), 2);
+        assert!(!source.contains("display_print") && !source.contains("__math_display_"));
+        let tree = atom_render_tree_value(&imported, &AttachmentSet::new()).unwrap();
+        let Value::Map(tree) = tree else {
+            panic!("tree")
+        };
+        let Value::Map(root) = &tree
+            .iter()
+            .find(|(k, _)| k == &Value::Text("root".into()))
+            .unwrap()
+            .1
+        else {
+            panic!("root")
+        };
+        assert_eq!(
+            root.iter()
+                .find(|(k, _)| k == &Value::Text("source".into()))
+                .unwrap()
+                .1,
+            Value::Text("attach(h,tr:primes(#2))".into())
+        );
+    }
+
+    #[test]
+    fn native_atoms_round_trip() {
+        // A restricted Symbolica build permits one instance per process. Keep
+        // this test's nonzero Atom operations in one thread; the other tests
+        // inspect opaque bytes or export zero to discover the backend version.
+        let atom = parse!("f(x)^2+1/3");
+        let payload = encode_atom_with_attachments(
+            &atom,
+            [attachment(
+                "org.symbolica.test",
+                1,
+                b"namespace::f",
+                b"metadata",
+            )],
+        )
+        .unwrap();
+        assert_eq!(
+            parse_payload(&payload).unwrap().import_atom().unwrap(),
+            atom
+        );
+        assert_eq!(decode_atom(&payload).unwrap(), atom);
+
+        let mut trailing_atom_payload = encode_atom(&atom).unwrap();
+        let atom_length = u32::from_be_bytes(trailing_atom_payload[14..18].try_into().unwrap());
+        trailing_atom_payload[14..18].copy_from_slice(&(atom_length + 1).to_be_bytes());
+        trailing_atom_payload.push(0);
+        let parsed_trailing = parse_payload(&trailing_atom_payload).unwrap();
+        assert!(matches!(
+            parsed_trailing.import_atom(),
+            Err(PayloadError::TrailingBytes)
+        ));
+
+        let rich = symbol!(
+            "symbolica_payload_test::g";
+            Symmetric, Linear, Real;
+            tags = ["symbolica_test::render"]
+        );
+        let rich_atom = function!(
+            rich,
+            symbol!("symbolica_payload_test::y"),
+            symbol!("symbolica_payload_test::x")
+        );
+        assert_eq!(
+            decode_atom(&encode_atom(&rich_atom).unwrap()).unwrap(),
+            rich_atom
+        );
+
+        let float_atom = Atom::num(Coefficient::Float(Complex::new(
+            Float::with_val(128, 1.44496_f64),
+            Float::with_val(128, 0),
+        )));
+        assert_eq!(
+            decode_atom(&encode_atom(&float_atom).unwrap()).unwrap(),
+            float_atom
+        );
+        let float_tree = atom_render_tree_value(&float_atom, &AttachmentSet::new()).unwrap();
+        let float_number = find_node(&float_tree, "number").unwrap();
+        assert_eq!(
+            value_field(float_number, "source"),
+            value_field(float_number, "text")
+        );
+        assert!(matches!(
+            value_field(float_number, "source"),
+            Some(Value::Text(source)) if !source.is_empty()
+        ));
+
+        let render_attachments = AttachmentSet::from_attachments([
+            attachment(
+                "org.symbolica.known",
+                1,
+                b"symbolica_payload_test::g",
+                b"known declaration",
+            ),
+            attachment(
+                "example.unknown-schema",
+                19,
+                b"opaque identity",
+                &[0xa2, 0x01, 0x02, 0x03],
+            ),
+        ])
+        .unwrap();
+        let x = symbol!("symbolica_payload_test::render_x");
+        let structured = rich_atom.clone() * Atom::var(x).pow(2) + Atom::num((1, 3));
+        let render_tree = atom_render_tree_value(&structured, &render_attachments).unwrap();
+
+        let Value::Map(envelope) = &render_tree else {
+            panic!("render tree envelope must be a map");
+        };
+        assert_eq!(
+            value_field(envelope, "protocol"),
+            Some(&Value::Text(RENDER_TREE_PROTOCOL.to_owned()))
+        );
+        assert_eq!(
+            value_field(envelope, "version"),
+            Some(&Value::Integer(i64::from(RENDER_TREE_VERSION).into()))
+        );
+        assert_eq!(
+            value_field(envelope, "kind"),
+            Some(&Value::Text(RENDER_TREE_KIND.to_owned()))
+        );
+        let Value::Array(exposed_attachments) = value_field(envelope, "attachments").unwrap()
+        else {
+            panic!("render tree attachments must be an array");
+        };
+        assert_eq!(exposed_attachments.len(), 2);
+        let Value::Map(unknown) = &exposed_attachments[0] else {
+            panic!("attachment must be a map");
+        };
+        assert_eq!(
+            value_field(unknown, "schema"),
+            Some(&Value::Text("example.unknown-schema".to_owned()))
+        );
+        assert_eq!(
+            value_field(unknown, "identity"),
+            Some(&Value::Bytes(b"opaque identity".to_vec()))
+        );
+        assert_eq!(
+            value_field(unknown, "data"),
+            Some(&Value::Bytes(vec![0xa2, 0x01, 0x02, 0x03]))
+        );
+
+        let root = value_field(envelope, "root").unwrap();
+        let mut kinds = std::collections::BTreeSet::new();
+        collect_node_kinds(root, &mut kinds);
+        assert!(
+            ["sum", "product", "power", "function", "variable", "number"]
+                .into_iter()
+                .all(|kind| kinds.contains(kind))
+        );
+
+        let function_node = find_node(root, "function").unwrap();
+        let Value::Map(function_symbol) = value_field(function_node, "symbol").unwrap() else {
+            panic!("function symbol must be a map");
+        };
+        assert_eq!(
+            value_field(function_symbol, "name"),
+            Some(&Value::Text("symbolica_payload_test::g".to_owned()))
+        );
+        assert_eq!(
+            value_field(function_symbol, "namespace"),
+            Some(&Value::Text("symbolica_payload_test".to_owned()))
+        );
+        assert_eq!(
+            value_field(function_symbol, "short-name"),
+            Some(&Value::Text("g".to_owned()))
+        );
+        assert_eq!(
+            value_field(function_symbol, "tags"),
+            Some(&Value::Array(vec![Value::Text(
+                "symbolica_test::render".to_owned()
+            )]))
+        );
+        let Value::Array(attributes) = value_field(function_symbol, "attributes").unwrap() else {
+            panic!("attributes must be an array");
+        };
+        for attribute in ["symmetric", "linear", "real"] {
+            assert!(attributes.contains(&Value::Text(attribute.to_owned())));
+        }
+        assert_eq!(
+            value_field(function_node, "source"),
+            Some(&Value::Text("g".to_owned()))
+        );
+
+        let Value::Bytes(call_payload) = value_field(function_node, "atom").unwrap() else {
+            panic!("function atom must be bytes");
+        };
+        let parsed_call = parse_payload(call_payload).unwrap();
+        assert_eq!(parsed_call.attachment_set(), render_attachments);
+        assert_eq!(parsed_call.import_atom().unwrap(), rich_atom);
+
+        let Value::Bytes(head_payload) = value_field(function_node, "head-atom").unwrap() else {
+            panic!("function head Atom must be bytes");
+        };
+        let parsed_head = parse_payload(head_payload).unwrap();
+        assert_eq!(parsed_head.attachment_set(), render_attachments);
+        assert_eq!(parsed_head.import_atom().unwrap(), Atom::var(rich));
+
+        let variable_node = find_node(root, "variable").unwrap();
+        let Value::Bytes(variable_payload) = value_field(variable_node, "atom").unwrap() else {
+            panic!("variable atom must be bytes");
+        };
+        let parsed_variable = parse_payload(variable_payload).unwrap();
+        assert_eq!(parsed_variable.attachment_set(), render_attachments);
+        assert!(matches!(
+            parsed_variable.import_atom().unwrap().as_view(),
+            AtomView::Var(_)
+        ));
+
+        let number_node = find_node(root, "number").unwrap();
+        assert!(value_field(number_node, "atom").is_none());
+        assert_eq!(
+            value_field(number_node, "source"),
+            value_field(number_node, "text")
+        );
+
+        let encoded_render_tree =
+            encode_atom_render_tree(&structured, &render_attachments).unwrap();
+        let decoded_render_tree =
+            ciborium::from_reader::<Value, _>(Cursor::new(encoded_render_tree)).unwrap();
+        assert_eq!(decoded_render_tree, render_tree);
+
+        let custom = symbol!(
+            "symbolica_payload_test::custom",
+            print = |_view, _options, _state| Some("callback-must-not-run".to_owned())
+        );
+        let custom_tree =
+            atom_render_tree_value(&Atom::var(custom), &AttachmentSet::new()).unwrap();
+        let custom_variable = find_node(&custom_tree, "variable").unwrap();
+        assert_eq!(
+            value_field(custom_variable, "source"),
+            Some(&Value::Text("\"custom\"".to_owned()))
+        );
+    }
+}

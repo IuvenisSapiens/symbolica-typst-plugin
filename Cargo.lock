@@ -875,24 +875,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "symbolica-typst-atom-payload"
-version = "0.1.0"
-dependencies = [
- "blake3",
- "ciborium",
- "symbolica",
-]
-
-[[package]]
 name = "symbolica-typst-plugin"
 version = "0.1.0"
 dependencies = [
  "ahash",
+ "blake3",
  "ciborium",
  "getrandom 0.3.4",
  "symbolica",
  "symbolica-integrate",
- "symbolica-typst-atom-payload",
  "wasm-minimal-protocol",
 ]
 

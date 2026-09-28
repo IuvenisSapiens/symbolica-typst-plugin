@@ -19,7 +19,7 @@ The adopted distribution is now the joint `symbolica` package. One
 `compressed-step-metadata` enabled and no Wizer stage or custom inflater.
 Both the top-level API and `init()` engines expose `integrate` and
 `integrate-with-steps`; the rule snapshot is prepared only on first integration
-use. The integration Rust bridge lives in `src/integration.rs`.
+use. The integration Rust bridge lives in `src/plugin/integration.rs`.
 
 The final release build (16 codegen units) measures:
 
