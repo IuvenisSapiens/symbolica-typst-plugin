@@ -2,8 +2,10 @@
 
 The plugin source, `Cargo.lock`, and build scripts are available in the
 [upstream repository](https://github.com/symbolica-dev/symbolica-typst-plugin).
-Each binary release must identify the matching source revision. The planned
-0.1.0 release uses tag `v0.1.0`; publish that tag before distributing the release.
+Version 0.1.0 is published on Typst Universe. Future releases use a matching
+`v<version>` tag and include `SOURCE.json` with the exact source revision and
+hashes of the engine and dependency lockfiles. See the repository's
+[release instructions](https://github.com/symbolica-dev/symbolica-typst-plugin/blob/main/docs/releasing.md).
 
 Dependencies are fetched from crates.io at the versions and checksums recorded
 in `Cargo.lock`, or from Git at the recorded commit. Symbolica uses `main` at
@@ -44,7 +46,7 @@ units, full LTO, and no Wizer preinitialization. Rust uses `opt-level = "s"`
 except for the generated `symbolica-integrate` rule code, which stays at `"z"`.
 Binaryen still applies `-Oz`. This mixed profile improves rule initialization
 while keeping the measured runtime archive below 8,000,000 bytes (8 MB).
-See [the optimization measurements](docs/wasm-optimization.md).
+See [the optimization measurements](https://github.com/symbolica-dev/symbolica-typst-plugin/blob/main/docs/wasm-optimization.md).
 
 Normal Cargo builds produce a reusable Rust library (`rlib`). Its default
 `native` feature uses Symbolica's native GMP/MPFR backend. For Wasm, disable

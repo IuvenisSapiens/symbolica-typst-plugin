@@ -1,0 +1,138 @@
+name: Prepare and release Typst package
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      name: ${{ steps.metadata.outputs.name }}
+      version: ${{ steps.metadata.outputs.version }}
+      package-id: ${{ steps.metadata.outputs.package-id }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Check version and publication status
+        id: metadata
+        env:
+          RELEASE_EVENT: ${{ github.event_name }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          args=()
+          if [[ "$RELEASE_EVENT" == push ]]; then
+            args+=(--tag "$RELEASE_TAG")
+          fi
+          python3 scripts/release.py preflight "${args[@]}"
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+      - name: Test release scripts and Rust library
+        run: |
+          nix develop -c python3 -m unittest discover -s scripts/tests
+          nix develop -c cargo test --locked
+          nix develop -c cargo test --locked --features plugin
+      - name: Rebuild Wasm and validate examples and manual
+        run: nix run .#check
+      - name: Stage release documentation and corresponding source
+        env:
+          SOURCE_REVISION: ${{ steps.metadata.outputs.source-revision }}
+          PACKAGE_NAME: ${{ steps.metadata.outputs.name }}
+          PACKAGE_VERSION: ${{ steps.metadata.outputs.version }}
+        run: |
+          nix develop -c python3 scripts/prepare-distribution.py --release --source-revision "$SOURCE_REVISION"
+          nix develop -c python3 scripts/readme-examples.py --package-root "dist/universe/packages/preview/$PACKAGE_NAME/$PACKAGE_VERSION"
+          nix run .#source-package
+          python3 scripts/release.py checksums
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ steps.metadata.outputs.package-id }}
+          path: |
+            dist/${{ steps.metadata.outputs.package-id }}*.tar.gz
+            dist/${{ steps.metadata.outputs.package-id }}-manual.pdf
+            dist/SHA256SUMS
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+  release:
+    if: github.event_name == 'push'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ needs.build.outputs.package-id }}
+          path: dist
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          PACKAGE_VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          cd dist
+          sha256sum --check SHA256SUMS
+          gh release create "$RELEASE_TAG" --verify-tag \
+            --title "Symbolica $PACKAGE_VERSION" --generate-notes \
+            ./*.tar.gz ./*-manual.pdf SHA256SUMS
+
+  registry:
+    if: github.event_name == 'push' && vars.REGISTRY_FORK != ''
+    needs: [build, release]
+    runs-on: ubuntu-latest
+    env:
+      REGISTRY_FORK: ${{ vars.REGISTRY_FORK }}
+      PACKAGE_NAME: ${{ needs.build.outputs.name }}
+      PACKAGE_VERSION: ${{ needs.build.outputs.version }}
+      PACKAGE_ID: ${{ needs.build.outputs.package-id }}
+    steps:
+      - name: Checkout current package registry
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: typst/packages
+          ref: main
+          path: registry
+          sparse-checkout: packages/preview/${{ needs.build.outputs.name }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ needs.build.outputs.package-id }}
+          path: dist
+      - name: Push new submission branch
+        env:
+          GH_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          test -n "$GH_TOKEN" || { echo 'Set REGISTRY_TOKEN to enable registry submission.' >&2; exit 1; }
+          [[ "$REGISTRY_FORK" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || exit 1
+          destination="packages/preview/$PACKAGE_NAME/$PACKAGE_VERSION"
+          test ! -e "registry/$destination" || { echo 'This package version is already published.' >&2; exit 1; }
+          (cd dist && sha256sum --check SHA256SUMS)
+          mkdir submission
+          tar -xzf "dist/$PACKAGE_ID-universe.tar.gz" -C submission
+          mkdir -p "registry/packages/preview/$PACKAGE_NAME"
+          cp -R "submission/$destination" "registry/$destination"
+          gh auth setup-git
+          cd registry
+          branch="release/$PACKAGE_ID"
+          fork_url="https://github.com/$REGISTRY_FORK.git"
+          existing="$(git ls-remote --heads "$fork_url" "$branch")"
+          test -z "$existing" || { echo 'Submission branch already exists; inspect it before retrying.' >&2; exit 1; }
+          git config user.name 'Lucien Huber'
+          git config user.email 'im@lcnbr.ch'
+          git switch -c "$branch"
+          git add -- "$destination"
+          git commit -m "$PACKAGE_NAME:$PACKAGE_VERSION"
+          git push "$fork_url" "HEAD:refs/heads/$branch"
+          owner="${REGISTRY_FORK%%/*}"
+          echo "Open the submission PR: https://github.com/typst/packages/compare/main...$owner:$branch?expand=1" >> "$GITHUB_STEP_SUMMARY"

@@ -1,10 +1,12 @@
 # Changelog
 
-All notable user-visible changes are recorded here. The Symbolica Typst plugin
-currently uses a local `0.1.0` package while its initial public surface is being
-prepared.
+All notable user-visible changes are recorded here. Version 0.1.0 is published
+on Typst Universe; the changes below are for the next version.
 
 ## Unreleased
+
+- Prepare version-tagged releases with staged README checks and generated
+  example images that render on Typst Universe.
 
 - Merge the shared Atom payload into `symbolica-typst-plugin`. Other Rust
   plugins can reuse its public `payload`, `math_display`, and `typst_ast`

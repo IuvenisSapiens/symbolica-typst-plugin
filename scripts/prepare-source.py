@@ -20,14 +20,16 @@ def main():
         source = Path(temporary) / name
         source.mkdir()
         for filename in ("Cargo.toml", "Cargo.lock", "flake.nix", "flake.lock",
-                         "typst.toml", "README.md", "REBUILDING.md", "LICENSE",
+                         "typst.toml", "README.md", "README-universe.md", "REBUILDING.md", "LICENSE",
                          "LICENSE-SYMBOLICA.md", "LICENSE-SYMBOLICA-TYPST.md",
                          "THIRD_PARTY.md", "THIRD_PARTY_LICENSES.txt", "CHANGELOG.md"):
             shutil.copyfile(ROOT / filename, source / filename)
         for directory in ("src", "tests", "scripts", "docs/license-sources",
-                          "docs/manual-assets", "symbolica/assets"):
+                          "docs/manual-assets", "symbolica/assets", "symbolica/readme",
+                          "symbolica/tests"):
             shutil.copytree(ROOT / directory, source / directory,
                             ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        shutil.copyfile(ROOT / "docs/releasing.md", source / "docs/releasing.md")
         for path in (ROOT / "symbolica").rglob("*.typ"):
             target = source / path.relative_to(ROOT)
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -37,7 +39,9 @@ def main():
             cwd=ROOT, text=True)
         config = config.replace(str(source / "vendor"), "vendor")
         (source / ".cargo").mkdir()
-        (source / ".cargo/config.toml").write_text(config)
+        # Keep the Wasm linker and custom getrandom backend when vendoring.
+        original_config = (ROOT / ".cargo/config.toml").read_text()
+        (source / ".cargo/config.toml").write_text(original_config + "\n" + config)
         archive = dist / f"{name}.tar.gz"
         with archive.open("wb") as raw:
             with gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as compressed:

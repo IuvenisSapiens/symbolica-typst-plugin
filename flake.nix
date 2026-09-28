@@ -4,6 +4,7 @@
 
   outputs = { self, nixpkgs, ... }:
     let
+      packageVersion = (builtins.fromTOML (builtins.readFile ./typst.toml)).package.version;
       systems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
       eachSystem = f: nixpkgs.lib.genAttrs systems (system: f (import nixpkgs { inherit system; }));
       typstWithPackages = pkgs: pkgs.typst.withPackages (packages: [
@@ -14,9 +15,10 @@
         for namespace in preview local; do
           package_dir="$check_dir/packages/$namespace/symbolica"
           mkdir -p "$package_dir"
-          ln -s "$PWD" "$package_dir/0.1.0"
+          ln -s "$PWD" "$package_dir/${packageVersion}"
         done
         export TYPST_PACKAGE_PATH="$check_dir/packages"
+        python3 scripts/readme-examples.py
         for example in basic showcase expression-grid lotka-volterra phase-portrait integration; do
           typst compile --root . "symbolica/examples/$example.typ" "$check_dir/$example.pdf"
         done
@@ -38,10 +40,13 @@
       '';
       packageScript = ''
         python3 scripts/prepare-distribution.py
+        python3 scripts/readme-examples.py --package-root "dist/universe/packages/preview/symbolica/${packageVersion}"
       '';
     in {
       devShells = eachSystem (pkgs: {
         default = pkgs.mkShell {
+          TYPST_FONT_PATHS = "${pkgs.dejavu_fonts}/share/fonts";
+          TYPST_IGNORE_SYSTEM_FONTS = "true";
           packages = [ pkgs.binaryen pkgs.cargo pkgs.lld pkgs.rustc pkgs.rustfmt pkgs.python3 pkgs.stdenv.cc (typstWithPackages pkgs) ];
         };
       });
@@ -50,7 +55,14 @@
           path = [ pkgs.binaryen pkgs.cargo pkgs.coreutils pkgs.diffutils pkgs.gnutar pkgs.gzip pkgs.lld pkgs.rustc pkgs.python3 pkgs.stdenv.cc (typstWithPackages pkgs) ];
           app = name: text: {
             type = "app";
-            program = "${pkgs.writeShellApplication { inherit name; runtimeInputs = path; inherit text; }}/bin/${name}";
+            program = "${pkgs.writeShellApplication {
+              inherit name;
+              runtimeInputs = path;
+              text = ''
+                export TYPST_FONT_PATHS="${pkgs.dejavu_fonts}/share/fonts"
+                export TYPST_IGNORE_SYSTEM_FONTS=true
+              '' + text;
+            }}/bin/${name}";
             meta.description = "Run ${name}";
           };
           engineBuildScript = builtins.readFile ./scripts/build-engine.sh;
@@ -86,7 +98,7 @@
             manual_packages="$(mktemp -d)"
             trap 'rm -rf "$manual_packages"' EXIT
             mkdir -p "$manual_packages/preview/symbolica"
-            ln -s "$PWD" "$manual_packages/preview/symbolica/0.1.0"
+            ln -s "$PWD" "$manual_packages/preview/symbolica/${packageVersion}"
             export TYPST_PACKAGE_PATH="$manual_packages"
             typst compile --creation-timestamp 0 --root . symbolica/manual.typ symbolica/manual.pdf
           '');
@@ -98,13 +110,15 @@
         });
       checks = eachSystem (pkgs: {
         default = pkgs.runCommand "symbolica-typst-check" {
+          TYPST_FONT_PATHS = "${pkgs.dejavu_fonts}/share/fonts";
+          TYPST_IGNORE_SYSTEM_FONTS = "true";
           nativeBuildInputs = [ pkgs.coreutils pkgs.diffutils pkgs.gnutar pkgs.gzip pkgs.python3 (typstWithPackages pkgs) ];
         } (''
           work="$TMPDIR/symbolica"
           mkdir -p "$work"
           cp -R ${self}/symbolica "$work/symbolica"
           cp -R ${self}/scripts "$work/scripts"
-          for file in typst.toml README.md LICENSE LICENSE-SYMBOLICA.md LICENSE-SYMBOLICA-TYPST.md THIRD_PARTY.md THIRD_PARTY_LICENSES.txt REBUILDING.md CHANGELOG.md; do
+          for file in typst.toml README.md README-universe.md LICENSE LICENSE-SYMBOLICA.md LICENSE-SYMBOLICA-TYPST.md THIRD_PARTY.md THIRD_PARTY_LICENSES.txt REBUILDING.md CHANGELOG.md; do
             cp "${self}/$file" "$work/$file"
           done
           chmod -R u+w "$work"
