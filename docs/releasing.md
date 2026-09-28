@@ -28,7 +28,7 @@ even though `typst.toml` excludes them from runtime downloads.
 
 Choose **Prepare and release Typst package → Run workflow** in GitHub Actions.
 This builds, tests, and uploads artifacts only. It does not create a GitHub
-release or push to the registry fork, even if run against a tag. A dry run can
+release or push a submission branch, even if run against a tag. A dry run can
 use the current manifest version while preparing an update to an already
 published package.
 
@@ -61,20 +61,37 @@ mismatched tags, outdated package imports, and versions already present in
 After validation, it creates a GitHub release containing the same artifacts.
 The corresponding source revision must remain publicly accessible.
 
-To also prepare a Universe submission, configure these repository settings
-before pushing the tag:
+The workflow also creates `release/symbolica-VERSION` in this repository, based
+on the released source, and adds the complete submission under
+`packages/preview/symbolica/VERSION`. It uses the built-in `GITHUB_TOKEN` with
+`contents: write`; no custom token or registry-fork setting is needed. It refuses
+to overwrite an existing submission branch. The job summary links to the
+prepared package files.
 
-- Variable `REGISTRY_FORK`: your fork of `typst/packages`, such as `lcnbr/packages`.
-- Secret `REGISTRY_TOKEN`: a token with permission to read the upstream registry
-  and push repository contents to that fork.
+## Submit to Typst packages
 
-With no `REGISTRY_FORK`, the workflow creates only the GitHub release. With the
-fork configured, it starts from current upstream `main`, copies the complete
-submission, and pushes a new `release/symbolica-VERSION` branch without force.
-Existing versions and existing submission branches cause an error. The job
-summary links to the comparison page for opening a PR to `typst/packages`.
+GitHub requires the PR branch to be in the `typst/packages` repository or one
+of its forks. This repository's submission branch holds the prepared files;
+the final PR goes through your fork of `typst/packages`.
 
-Review and submit that PR as the existing package maintainer. Universe
+In a clean clone of that fork, replace `VERSION` below with the released version:
+
+```sh
+git fetch https://github.com/typst/packages.git main
+git switch -c release/symbolica-VERSION FETCH_HEAD
+git fetch https://github.com/symbolica-dev/symbolica-typst-plugin.git release/symbolica-VERSION
+git restore --source=FETCH_HEAD -- packages/preview/symbolica/VERSION
+git add packages/preview/symbolica/VERSION
+git commit -m 'symbolica:VERSION'
+git push -u origin HEAD
+```
+
+This copies only the package directory into the registry history. You can also
+extract the GitHub release's `symbolica-VERSION-universe.tar.gz` into your fork
+instead of fetching the submission branch. Use your usual GitHub credentials
+for the push; they do not need to be stored in this repository's Actions secrets.
+
+Open and review the PR against `typst/packages:main`. Universe
 publication occurs after the registry maintainers merge the PR and its
 deployment completes; creating the GitHub release alone does not publish to
 Universe. See the [registry submission instructions](https://github.com/typst/packages/blob/main/docs/README.md).
