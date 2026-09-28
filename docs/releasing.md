@@ -61,18 +61,47 @@ mismatched tags, outdated package imports, and versions already present in
 After validation, it creates a GitHub release containing the same artifacts.
 The corresponding source revision must remain publicly accessible.
 
-The workflow also creates `release/symbolica-VERSION` in this repository, based
-on the released source, and adds the complete submission under
-`packages/preview/symbolica/VERSION`. It uses the built-in `GITHUB_TOKEN` with
-`contents: write`; no custom token or registry-fork setting is needed. It refuses
-to overwrite an existing submission branch. The job summary links to the
-prepared package files.
+The workflow prepares `release/symbolica-VERSION` with the package under
+`packages/preview/symbolica/VERSION`. Configure a registry fork to push a branch
+based on current `typst/packages:main` directly to that fork. Without this
+configuration, it creates the branch here, based on the released source, using
+the built-in `GITHUB_TOKEN`. Both paths refuse to overwrite an existing branch.
+
+## Configure the registry fork
+
+The first release used [`benruijl/packages`](https://github.com/benruijl/packages),
+a fork of `typst/packages`. To reuse it:
+
+1. As `benruijl`, create a fine-grained personal access token with resource
+   owner `benruijl`, **Only select repositories → packages**, and repository
+   permission **Contents → Read and write**. Set an expiration date.
+2. In `symbolica-dev/symbolica-typst-plugin`, open **Settings → Secrets and
+   variables → Actions**. Add a repository secret named `REGISTRY_TOKEN`
+   containing the token, and a repository variable named `REGISTRY_FORK`
+   containing `benruijl/packages`.
+
+Store the token directly in Actions secrets. It does not belong in source files
+or chat. Renew it before its expiration date.
+
+The fork owner creates this token: GitHub currently does not support
+fine-grained tokens for writing to another user's repository as a collaborator.
+See [GitHub's token documentation](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens#fine-grained-personal-access-tokens-limitations).
+For local pushes as `lcnbr`, Ben can also invite `lcnbr` as a collaborator on
+`benruijl/packages`; this is separate from the workflow's token.
+
+The workflow checks out only `packages/preview/symbolica` from current upstream
+`main`, adds the new version, and pushes the submission branch to the fork.
+There is no need to sync the fork's `main` first. Its job summary links to the
+comparison page for opening the PR. Dry runs never push either kind of branch.
 
 ## Submit to Typst packages
 
-GitHub requires the PR branch to be in the `typst/packages` repository or one
-of its forks. This repository's submission branch holds the prepared files;
-the final PR goes through your fork of `typst/packages`.
+With a registry fork configured, open the PR using the link in the workflow's
+job summary. GitHub requires its source branch to be in `typst/packages` or one
+of its forks.
+
+Without that configuration, copy the prepared files from this repository's
+submission branch into your fork as follows.
 
 In a clean clone of that fork, replace `VERSION` below with the released version:
 

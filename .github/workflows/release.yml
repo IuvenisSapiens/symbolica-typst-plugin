@@ -88,7 +88,7 @@ jobs:
             ./*.tar.gz ./*-manual.pdf SHA256SUMS
 
   submission:
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' && vars.REGISTRY_FORK == ''
     needs: [build, release]
     runs-on: ubuntu-latest
     permissions:
@@ -129,3 +129,53 @@ jobs:
           git push origin "HEAD:refs/heads/$branch"
           echo "Prepared package: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/tree/$branch/$destination" >> "$GITHUB_STEP_SUMMARY"
           echo "Copy this package into a fork of typst/packages to open the submission PR. See $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/blob/$GITHUB_SHA/docs/releasing.md#submit-to-typst-packages" >> "$GITHUB_STEP_SUMMARY"
+
+  registry:
+    if: github.event_name == 'push' && vars.REGISTRY_FORK != ''
+    needs: [build, release]
+    runs-on: ubuntu-latest
+    env:
+      REGISTRY_FORK: ${{ vars.REGISTRY_FORK }}
+      PACKAGE_NAME: ${{ needs.build.outputs.name }}
+      PACKAGE_VERSION: ${{ needs.build.outputs.version }}
+      PACKAGE_ID: ${{ needs.build.outputs.package-id }}
+    steps:
+      - name: Checkout current package registry
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: typst/packages
+          ref: main
+          path: registry
+          sparse-checkout: packages/preview/${{ needs.build.outputs.name }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ needs.build.outputs.package-id }}
+          path: dist
+      - name: Push submission to registry fork
+        env:
+          GH_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          test -n "$GH_TOKEN" || { echo 'Set REGISTRY_TOKEN to push to REGISTRY_FORK.' >&2; exit 1; }
+          [[ "$REGISTRY_FORK" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || exit 1
+          destination="packages/preview/$PACKAGE_NAME/$PACKAGE_VERSION"
+          test ! -e "registry/$destination" || { echo 'This package version is already published.' >&2; exit 1; }
+          (cd dist && sha256sum --check SHA256SUMS)
+          mkdir submission
+          tar -xzf "dist/$PACKAGE_ID-universe.tar.gz" -C submission
+          mkdir -p "registry/packages/preview/$PACKAGE_NAME"
+          cp -R "submission/$destination" "registry/$destination"
+          gh auth setup-git
+          cd registry
+          branch="release/$PACKAGE_ID"
+          fork_url="$GITHUB_SERVER_URL/$REGISTRY_FORK.git"
+          existing="$(git ls-remote --heads "$fork_url" "refs/heads/$branch")"
+          test -z "$existing" || { echo 'Submission branch already exists; inspect it before retrying.' >&2; exit 1; }
+          git config user.name 'Lucien Huber'
+          git config user.email 'im@lcnbr.ch'
+          git switch -c "$branch"
+          git add -- "$destination"
+          git commit -m "$PACKAGE_NAME:$PACKAGE_VERSION"
+          git push "$fork_url" "HEAD:refs/heads/$branch"
+          owner="${REGISTRY_FORK%%/*}"
+          echo "Open the submission PR: $GITHUB_SERVER_URL/typst/packages/compare/main...$owner:$branch?expand=1" >> "$GITHUB_STEP_SUMMARY"

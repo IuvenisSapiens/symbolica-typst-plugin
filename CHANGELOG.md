@@ -7,7 +7,8 @@ on Typst Universe; the changes below are for the next version.
 
 - Prepare version-tagged releases with staged README checks and generated
   example images that render on Typst Universe. Stage registry submissions on
-  a branch in this repository using the built-in GitHub Actions token.
+  a branch in this repository using the built-in GitHub Actions token, or push
+  directly to a configured registry fork using a scoped token.
 
 - Merge the shared Atom payload into `symbolica-typst-plugin`. Other Rust
   plugins can reuse its public `payload`, `math_display`, and `typst_ast`
