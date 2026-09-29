@@ -1,12 +1,19 @@
 [package]
 name = "symbolica-typst-plugin"
 version = "0.1.0"
+authors = ["Lucien Huber <im@lcnbr.ch>", "Ben Ruijl"]
 edition = "2024"
-publish = false
+rust-version = "1.97"
+publish = ["crates-io"]
 description = "Symbolica for Typst, with reusable annotated expression interchange"
 license = "MIT"
+readme = "README-crate.md"
+homepage = "https://symbolica.io"
+documentation = "https://docs.rs/symbolica-typst-plugin"
 repository = "https://github.com/symbolica-dev/symbolica-typst-plugin"
-include = ["/src/**", "/tests/**", "/Cargo.toml", "/README.md", "/LICENSE"]
+keywords = ["symbolica", "typst", "symbolic", "algebra", "wasm"]
+categories = ["mathematics", "wasm", "encoding"]
+include = ["/src/**", "/tests/**", "/Cargo.toml", "/README-crate.md", "/LICENSE", "/LICENSE-SYMBOLICA.md", "/LICENSE-SYMBOLICA-TYPST.md"]
 
 [lib]
 name = "symbolica_typst_plugin"
@@ -26,14 +33,9 @@ ahash = { version = "0.8", default-features = false, features = ["std", "compile
 blake3 = "1"
 ciborium = "0.2.2"
 getrandom = { version = "0.3", optional = true }
-symbolica = { version = "3.0", default-features = false }
+symbolica = { version = "3.0.1", default-features = false }
 symbolica-integrate = { version = "2.0.1", default-features = false, features = ["compressed-step-metadata"], optional = true }
 wasm-minimal-protocol = { version = "0.1", optional = true }
-
-# Select sources at the build root so overrides apply to every consumer.
-# Cargo.lock pins the exact commit for reproducible builds.
-[patch.crates-io]
-symbolica = { git = "https://github.com/symbolica-dev/symbolica.git", branch = "main" }
 
 [profile.release]
 lto = true

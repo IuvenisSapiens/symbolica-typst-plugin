@@ -95,9 +95,8 @@ when embedding the library. The build script selects `cdylib` and `wasm,plugin`
 to produce the standalone Wasm module.
 
 The crate is not yet published on crates.io. Use a path dependency or pinned Git
-revision and select the compatible Symbolica revision in your workspace's
-Cargo patch table, as described in [rebuilding](REBUILDING.md). Cargo does not
-inherit patches from dependencies.
+revision. Symbolica 3.0.1 comes from crates.io; no Cargo patch is needed. See
+[rebuilding](REBUILDING.md) for build options and dependency overrides.
 
 ## Licensing
 

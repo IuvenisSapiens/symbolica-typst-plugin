@@ -20,7 +20,7 @@ def main():
         source = Path(temporary) / name
         source.mkdir()
         for filename in ("Cargo.toml", "Cargo.lock", "flake.nix", "flake.lock",
-                         "typst.toml", "README.md", "README-universe.md", "REBUILDING.md", "LICENSE",
+                         "typst.toml", "README.md", "README-universe.md", "README-crate.md", "REBUILDING.md", "LICENSE",
                          "LICENSE-SYMBOLICA.md", "LICENSE-SYMBOLICA-TYPST.md",
                          "THIRD_PARTY.md", "THIRD_PARTY_LICENSES.txt", "CHANGELOG.md"):
             shutil.copyfile(ROOT / filename, source / filename)

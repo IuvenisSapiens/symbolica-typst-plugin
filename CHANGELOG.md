@@ -5,6 +5,12 @@ on Typst Universe; the changes below are for the next version.
 
 ## Unreleased
 
+- Prepare Rust crate metadata and a library README for crates.io, with Lucien
+  Huber listed first among the authors.
+
+- Update Symbolica to the crates.io 3.0.1 release and remove the Git override.
+  Consumers no longer need a Symbolica Cargo patch.
+
 - Prepare version-tagged releases with staged README checks and generated
   example images that render on Typst Universe. Stage registry submissions on
   a branch in this repository using the built-in GitHub Actions token, or push

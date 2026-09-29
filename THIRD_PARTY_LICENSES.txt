@@ -11521,10 +11521,10 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 
 ========================================================================
-numerica 3.0.0
+numerica 3.0.1
 License: MIT
 Repository: https://github.com/symbolica-dev/numerica
-Source archive: https://crates.io/api/v1/crates/numerica/3.0.0/download
+Source archive: https://crates.io/api/v1/crates/numerica/3.0.1/download
 
 --- License.md ---
 MIT License
@@ -17409,12 +17409,10 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
 ========================================================================
-symbolica 3.0.0
+symbolica 3.0.1
 License: License.md
 Repository: https://github.com/symbolica-dev/symbolica
-Source: git+https://github.com/symbolica-dev/symbolica.git?branch=main#06906976bca24fefc5203aee699d90d62ebe08cd
-Revision: 06906976bca24fefc5203aee699d90d62ebe08cd
-Source archive: https://github.com/symbolica-dev/symbolica/archive/06906976bca24fefc5203aee699d90d62ebe08cd.tar.gz
+Source archive: https://crates.io/api/v1/crates/symbolica/3.0.1/download
 
 --- License.md ---
 # Symbolica Source-Available License 1.0

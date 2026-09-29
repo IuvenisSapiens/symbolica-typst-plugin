@@ -20,9 +20,8 @@ Apache-2.0, the distribution uses MIT where available, and otherwise an
 applicable permissive alternative. Reproducing the alternative texts does not
 require recipients to accept every alternative simultaneously.
 
-Symbolica 3.0.0 is built from `main` at revision
-[`06906976bca24fefc5203aee699d90d62ebe08cd`](https://github.com/symbolica-dev/symbolica/tree/06906976bca24fefc5203aee699d90d62ebe08cd),
-as pinned in `Cargo.lock`. It is covered by its
+Symbolica 3.0.1 is built from the crates.io release pinned in `Cargo.lock`.
+It is covered by its
 [source-available license](LICENSE-SYMBOLICA.md) and the overriding
 [Symbolica Typst permission](LICENSE-SYMBOLICA-TYPST.md).
 The latter grants runtime use within Typst without payment, registration,

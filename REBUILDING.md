@@ -8,26 +8,15 @@ hashes of the engine and dependency lockfiles. See the repository's
 [release instructions](https://github.com/symbolica-dev/symbolica-typst-plugin/blob/main/docs/releasing.md).
 
 Dependencies are fetched from crates.io at the versions and checksums recorded
-in `Cargo.lock`, or from Git at the recorded commit. Symbolica uses `main` at
-[`06906976bca24fefc5203aee699d90d62ebe08cd`](https://github.com/symbolica-dev/symbolica/tree/06906976bca24fefc5203aee699d90d62ebe08cd).
-Versioned dependencies and the root crates.io patch keep the plugin, integration
-engine, and reusable payload modules on this revision. [Third-party notices](THIRD_PARTY_LICENSES.txt) provide
-exact source archive URLs and Git revisions for the Wasm build.
+in `Cargo.lock`. The plugin, integration engine, and reusable payload modules
+use Symbolica 3.0.1 from crates.io. [Third-party notices](THIRD_PARTY_LICENSES.txt)
+provide exact source archive URLs for the Wasm build.
 
-The root `[patch.crates-io]` table selects the Symbolica source. Change or replace
-that entry to select another compatible Git revision or local checkout, then
-update the lockfile. There is no direct Git dependency on Symbolica that would
-bypass the patch. The payload implementation is part of `symbolica-typst-plugin`;
-there is no separate payload crate or patch entry.
-
-When embedding the library in another workspace, that workspace supplies its
-own Symbolica patch. Cargo does not inherit patch tables from dependencies.
-To use the revision above, add this at the consuming workspace's root:
-
-```toml
-[patch.crates-io]
-symbolica = { git = "https://github.com/symbolica-dev/symbolica.git", rev = "06906976bca24fefc5203aee699d90d62ebe08cd" }
-```
+Consumers can use the same crates.io release without a Cargo patch. To test a
+compatible Git revision or local checkout, add a `[patch.crates-io]` override
+at the build root and update its lockfile. Cargo does not inherit patches from
+dependencies. The payload implementation is part of `symbolica-typst-plugin`;
+there is no separate payload crate.
 
 ## Build
 
@@ -38,9 +27,9 @@ Check out the source revision matching the binary. Install Rust 1.97.0, its
 bash scripts/build-engine.sh
 ```
 
-The build uses `cargo rustc --locked`, so it retains the recorded Git revision
-even when `main` advances. Update the lockfile explicitly when upgrading
-dependencies. Cargo downloads the locked dependencies. The result is
+The build uses `cargo rustc --locked`, so it retains the recorded dependency
+versions. Update the lockfile explicitly when upgrading dependencies. Cargo
+downloads the locked dependencies. The result is
 `symbolica/symbolica.wasm`. The release profile uses the default 16 codegen
 units, full LTO, and no Wizer preinitialization. Rust uses `opt-level = "s"`
 except for the generated `symbolica-integrate` rule code, which stays at `"z"`.
@@ -70,10 +59,9 @@ cargo test --locked
 cargo test --locked --features plugin
 ```
 
-Before publishing the crate, select and validate a crates.io release of
-Symbolica, including its Atom export compatibility. The current build remains
-pinned to the Git revision above. The Cargo package includes Rust sources,
-tests, the README, and license; generated Wasm and the manual PDF are distributed
+Symbolica is resolved from crates.io; the plugin crate itself is not yet
+published. The Cargo package includes Rust sources, tests, the README, and
+license; generated Wasm and the manual PDF are distributed
 with the Typst package separately.
 
 To rebuild with a modified dependency whose license permits modification,
@@ -92,9 +80,9 @@ limited permission in `LICENSE-SYMBOLICA-TYPST.md`.
 
 Maintainers can run `python3 scripts/prepare-source.py` to generate
 `dist/symbolica-0.1.0-source.tar.gz`, containing the plugin source and vendored
-dependencies, including the locked Git checkout and Cargo source replacements
-needed to rebuild without fetching dependencies. This is an optional convenience
-and availability backup, not a required archive format. It is not included in the Typst runtime package.
+dependencies and Cargo source replacements needed to rebuild without fetching
+dependencies. This is an optional convenience and availability backup, not a
+required archive format. It is not included in the Typst runtime package.
 
 Source access must remain available to binary recipients. Hosting sources on
 crates.io or GitHub does not remove the distributor's responsibility to ensure
